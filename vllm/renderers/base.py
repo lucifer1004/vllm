@@ -700,6 +700,9 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["prompt"] = prompt_text
         if cache_salt := prompt.get("cache_salt"):
             engine_input["cache_salt"] = cache_salt
+        for key in ("raw_conversation", "task_type", "task_extra_kwargs"):
+            if key in prompt:
+                engine_input[key] = prompt[key]
 
         return engine_input
 
@@ -756,6 +759,9 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["prompt"] = prompt_text
         if cache_salt := prompt.get("cache_salt"):
             engine_input["cache_salt"] = cache_salt
+        for key in ("raw_conversation", "task_type", "task_extra_kwargs"):
+            if key in prompt:
+                engine_input[key] = prompt[key]
 
         return engine_input
 

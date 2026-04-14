@@ -27,6 +27,9 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.tasks.custom_task_registry import (
+    register_enabled_engine_core_tasks,
+)
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -217,6 +220,12 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
+        self._hooks: dict[str, list[Callable[..., Any]]] = {}
+        self.task_allowed_token_ids: dict[str, list[int] | Callable[..., Any]] = {}
+        self.task_stop_token_ids: dict[str, list[int] | Callable[..., Any]] = {}
+        self.task_skip_inference: dict[str, bool | Callable[..., Any]] = {}
+
+        register_enabled_engine_core_tasks(self, vllm_config)
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -292,6 +301,79 @@ class EngineCore:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
+    def register_hook(self, name: str, fn: Callable[..., Any]) -> None:
+        self._hooks.setdefault(name, []).append(fn)
+
+    def _run_hooks(self, name: str, *args: Any, **kwargs: Any) -> list[Any]:
+        results: list[Any] = []
+        for fn in self._hooks.get(name, []):
+            try:
+                item = fn(*args, **kwargs)
+            except Exception:
+                logger.exception("Custom task hook %s failed: %s", name, fn)
+                raise
+
+            if item is None:
+                continue
+            if isinstance(item, list):
+                results.extend(item)
+            else:
+                results.append(item)
+        return results
+
+    def apply_task_specific_token_constraints(self, request: Request) -> None:
+        task_type = request.task_type
+        if task_type is None or request.sampling_params is None:
+            return
+
+        task_extra_kwargs = request.task_extra_kwargs or {}
+
+        if task_type in self.task_allowed_token_ids:
+            allowed_token_ids = self.task_allowed_token_ids[task_type]
+            if callable(allowed_token_ids):
+                allowed = allowed_token_ids(task_type, task_extra_kwargs)
+            else:
+                allowed = allowed_token_ids
+            request.sampling_params.allowed_token_ids = (
+                request.sampling_params.allowed_token_ids or []
+            ) + list(allowed)
+
+        if task_type in self.task_stop_token_ids:
+            stop_token_ids = self.task_stop_token_ids[task_type]
+            if callable(stop_token_ids):
+                stops = stop_token_ids(task_type, task_extra_kwargs)
+            else:
+                stops = stop_token_ids
+            request.sampling_params.stop_token_ids = (
+                request.sampling_params.stop_token_ids or []
+            ) + list(stops)
+
+    def should_skip_inference(self, request: Request) -> bool:
+        task_type = request.task_type
+        if task_type is None or task_type not in self.task_skip_inference:
+            return False
+
+        skip_inference = self.task_skip_inference[task_type]
+        if callable(skip_inference):
+            return bool(skip_inference(task_type, request.task_extra_kwargs or {}))
+        return bool(skip_inference)
+
+    def custom_execute_model(self, *args: Any, **kwargs: Any) -> Any:
+        def default_preprocess_fn(*proc_args: Any, **proc_kwargs: Any):
+            return proc_args, proc_kwargs
+
+        def default_postprocess_fn(output: Any, *proc_args: Any, **proc_kwargs: Any):
+            return output
+
+        preprocess_fn = kwargs.pop("preprocess_fn", default_preprocess_fn)
+        postprocess_fn = kwargs.pop("postprocess_fn", default_postprocess_fn)
+
+        executor_args, executor_kwargs = preprocess_fn(*args, **kwargs)
+        output = self.model_executor.custom_execute_model(
+            *executor_args, **executor_kwargs
+        )
+        return postprocess_fn(output, *args, **kwargs)
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 
@@ -323,6 +405,7 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        self.apply_task_specific_token_constraints(request)
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -391,6 +474,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        self._run_hooks("on_new_requests", scheduler_output.scheduled_new_reqs)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -1183,6 +1267,7 @@ class EngineCoreProc(EngineCore):
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
+            self._run_hooks("on_step_outputs", output[1].outputs)
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
@@ -1583,6 +1668,31 @@ class EngineCoreProc(EngineCore):
                 by_client[client_index].add(req_id)
             for client_index, req_ids in by_client.items():
                 self._send_abort_outputs_to_client(list(req_ids), client_index)
+
+    def step_passthrough(self, request: Request) -> None:
+        logger.info(
+            "Skipping text inference for request %s (task=%s)",
+            request.request_id,
+            request.task_type,
+        )
+        self._run_hooks("on_new_requests", [request])
+        fake_outputs = [
+            EngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[2],
+                finish_reason=FinishReason.STOP,
+            )
+        ]
+        self._run_hooks("on_step_outputs", fake_outputs)
+        self.output_queue.put(
+            (request.client_index, EngineCoreOutputs(outputs=fake_outputs))
+        )
+
+    def add_request(self, request: Request, request_wave: int = 0):
+        if self.should_skip_inference(request):
+            self.step_passthrough(request)
+            return
+        super().add_request(request, request_wave)
 
 
 class DPEngineCoreProc(EngineCoreProc):

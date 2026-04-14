@@ -745,6 +745,10 @@ class Worker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
+    def custom_execute_model(self, *args: Any, **kwargs: Any):
+        return self.model_runner.custom_execute_model(*args, **kwargs)
+
+    @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:

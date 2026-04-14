@@ -96,6 +96,9 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
+from vllm.multimodal.tasks.custom_task_registry import (
+    register_enabled_model_runner_tasks,
+)
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
@@ -218,6 +221,12 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def _assert_callable(obj: Any, name: str) -> Callable[..., Any]:
+    if not callable(obj):
+        raise TypeError(f"{name} is not callable: {obj!r}")
+    return obj
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -852,6 +861,28 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
+        self._CUSTOM_TASK_REGISTRY: dict[str, dict[str, Callable[..., Any]]] = {}
+
+        register_enabled_model_runner_tasks(self)
+
+    def register_task_callables(
+        self,
+        task_type: str,
+        preprocess_fn: Callable[..., Any],
+        postprocess_fn: Callable[..., Any],
+        custom_forward_method: str,
+    ) -> None:
+        self._CUSTOM_TASK_REGISTRY[task_type] = {
+            "preprocess_fn": preprocess_fn,
+            "postprocess_fn": postprocess_fn,
+            "custom_forward_method": custom_forward_method,
+        }
+
+    def _get_task_callables(self, task_type: str) -> dict[str, Any]:
+        try:
+            return self._CUSTOM_TASK_REGISTRY[task_type]
+        except KeyError as exc:
+            raise KeyError(f"task_type={task_type} not registered!") from exc
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -4407,6 +4438,26 @@ class GPUModelRunner(
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
         return DraftTokenIds(req_ids, draft_token_ids)
+
+    @torch.inference_mode()
+    def custom_execute_model(self, *args: Any, **kwargs: Any) -> Any:
+        task_type: str = kwargs.pop("task_type", "None")
+        callables = self._get_task_callables(task_type)
+
+        preprocess_fn = _assert_callable(callables["preprocess_fn"], "preprocess_fn")
+        forward_method = callables["custom_forward_method"]
+        postprocess_fn = _assert_callable(callables["postprocess_fn"], "postprocess_fn")
+
+        attn_meta, exec_args, exec_kwargs = preprocess_fn(*args, **kwargs)
+
+        with set_forward_context(attn_meta, self.vllm_config):
+            forward_callable = _assert_callable(
+                getattr(self.model, forward_method),
+                f"model.{forward_method}",
+            )
+            result = forward_callable(*exec_args, **exec_kwargs)
+
+        return postprocess_fn(result)
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False

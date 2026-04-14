@@ -332,6 +332,9 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            raw_conversation=decoder_inputs.get("raw_conversation"),
+            task_type=decoder_inputs.get("task_type"),
+            task_extra_kwargs=decoder_inputs.get("task_extra_kwargs"),
         )
 
     def _validate_prompt_len(

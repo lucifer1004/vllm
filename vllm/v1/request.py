@@ -73,6 +73,9 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        raw_conversation: list[dict[str, Any]] | None = None,
+        task_type: str | None = None,
+        task_extra_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -176,6 +179,10 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
+        self.raw_conversation = raw_conversation
+        self.task_type = task_type
+        self.task_extra_kwargs = task_extra_kwargs
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -198,6 +205,9 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            raw_conversation=request.raw_conversation,
+            task_type=request.task_type,
+            task_extra_kwargs=request.task_extra_kwargs,
         )
 
     def append_output_token_ids(

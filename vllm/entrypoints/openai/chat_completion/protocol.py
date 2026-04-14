@@ -110,6 +110,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    image: str | None = Field(default=None, description="Image data.")
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -152,6 +153,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
     model: str | None = None
+    task_type: str | None = None
+    task_extra_kwargs: dict[str, Any] | None = None
     frequency_penalty: float | None = 0.0
     logit_bias: dict[str, float] | None = None
     logprobs: bool | None = False

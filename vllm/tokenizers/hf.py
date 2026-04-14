@@ -2,16 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import copy
+import importlib.util
 from pathlib import Path
 from typing import TypeAlias
 
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
+from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_sentence_transformer_tokenizer_config
 
 from .protocol import TokenizerLike
 
 HfTokenizer: TypeAlias = PreTrainedTokenizer | PreTrainedTokenizerFast
+
+logger = init_logger(__name__)
 
 
 def get_cached_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
@@ -82,14 +86,30 @@ class CachedHfTokenizer(TokenizerLike):
         **kwargs,
     ) -> HfTokenizer:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                path_or_repo_id,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                cache_dir=download_dir,
-                **kwargs,
-            )
+            architectures = kwargs.get("architectures") or []
+            if architectures and architectures[0] == "HunyuanImage3ForCausalMM":
+                logger.info("Loading tokenizer wrapper from %s", path_or_repo_id)
+                module_path = Path(path_or_repo_id) / "tokenizer_wrapper.py"
+                spec = importlib.util.spec_from_file_location(
+                    "hunyuan_image3_tokenizer_wrapper",
+                    module_path,
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(
+                        f"Failed to load tokenizer wrapper from {module_path}"
+                    )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                tokenizer = module.TokenizerWrapper(str(path_or_repo_id)).tokenizer
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    path_or_repo_id,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    cache_dir=download_dir,
+                    **kwargs,
+                )
         except ValueError as e:
             # If the error pertains to the tokenizer class not existing or not
             # currently being imported,

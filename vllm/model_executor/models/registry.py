@@ -554,6 +554,7 @@ _MULTIMODAL_MODELS = {
         "NemotronParseForConditionalGeneration",
     ),
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),
+    "HunyuanImage3ForCausalMM": ("hunyuan_image3", "HunyuanImage3ForCausalMM"),
 }
 
 _SPECULATIVE_DECODING_MODELS = {
