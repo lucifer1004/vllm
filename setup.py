@@ -967,8 +967,15 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-    if envs.VLLM_USE_PRECOMPILED or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+    disable_fa3 = os.environ.get("VLLM_DISABLE_FA3", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not disable_fa3 and (
+        envs.VLLM_USE_PRECOMPILED
+        or (CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3"))
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))

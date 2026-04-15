@@ -61,7 +61,7 @@ def import_triton_kernels():
     For convenience, prioritize triton_kernels that is available in
     `site-packages`. Use `vllm.third_party.triton_kernels` as a fall-back.
     """
-    if _has_module("triton_kernels"):
+    if _has_module("triton_kernels.matmul_ogs"):
         import triton_kernels
 
         logger.debug_once(
