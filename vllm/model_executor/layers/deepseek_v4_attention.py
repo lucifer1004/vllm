@@ -19,11 +19,14 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
+from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    dequantize_combined_sparse_mla_decode_kv,
+    dequantize_global_slots_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
@@ -73,19 +76,26 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
-    disable_triton_sparse_mla_cudagraphs_if_enabled,
     is_triton_sparse_mla_enabled,
     is_triton_sparse_mla_enabled_for_platform,
+    triton_sparse_mla_matmul_decode_enabled,
     triton_sparse_mla_query_chunk_size,
+    triton_sparse_mla_splitkv_decode_enabled,
     triton_sparse_mla_topk_chunk_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
+    build_combined_sparse_mla_decode_valid_mask,
+    choose_sparse_mla_splitkv_splits,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
+    fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
+    fp8ds_paged_sparse_mla_attention_with_sink_multihead,
+    matmul_sparse_mla_attention_with_sink,
     sparse_mla_decode_head_block_size,
+    splitkv_sparse_mla_attention_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
@@ -239,8 +249,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.window_size = window_size
         self.compress_ratio = compress_ratio if compress_ratio is not None else 1
         self.prefix = prefix
-
-        disable_triton_sparse_mla_cudagraphs_if_enabled(mla_modules.vllm_config)
 
         # Extract config from vllm_config
         config = mla_modules.vllm_config.model_config.hf_config
@@ -861,7 +869,27 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
+        max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
+        if not mtp_decode:
+            fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+                q=q,
+                k_cache=swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                block_size=swa_metadata.block_size,
+                candidate_offset=0,
+                num_candidates=max_swa_len,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output,
+                head_block_size=head_block_size,
+                num_heads=self.num_heads,
+            )
+            if output.shape[1] > self.num_heads:
+                output[:, self.num_heads :].zero_()
+            return
 
         (
             swa_max_score,
@@ -875,35 +903,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_max_score.fill_(float("-inf"))
         swa_denom.zero_()
         swa_acc.zero_()
-        if mtp_decode:
-            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
-                q=q,
-                k_cache=swa_k_cache,
-                slot_ids=swa_indices,
-                lens=swa_lens,
-                block_size=swa_metadata.block_size,
-                scale=self.scale,
-                max_score=swa_max_score,
-                denom=swa_denom,
-                acc=swa_acc,
-                head_block_size=head_block_size,
-            )
-        else:
-            accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
-                q=q,
-                k_cache=swa_k_cache,
-                seq_lens=swa_metadata.seq_lens[:num_decodes],
-                gather_lens=swa_lens,
-                block_table=swa_metadata.block_table[:num_decodes],
-                block_size=swa_metadata.block_size,
-                candidate_offset=0,
-                num_candidates=swa_metadata.decode_swa_indices.shape[-1],
-                scale=self.scale,
-                max_score=swa_max_score,
-                denom=swa_denom,
-                acc=swa_acc,
-                head_block_size=head_block_size,
-            )
+        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+            q=q,
+            k_cache=swa_k_cache,
+            slot_ids=swa_indices,
+            lens=swa_lens,
+            block_size=swa_metadata.block_size,
+            scale=self.scale,
+            max_score=swa_max_score,
+            denom=swa_denom,
+            acc=swa_acc,
+            head_block_size=head_block_size,
+        )
         finish_sparse_mla_attention_with_sink(
             swa_max_score,
             swa_denom,
@@ -946,6 +957,140 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
+        if (
+            compressed_topk <= topk_chunk_size
+            and triton_sparse_mla_matmul_decode_enabled()
+        ):
+            total_candidates = compressed_topk + max_swa_len
+            num_splitkv_splits = 1
+            if triton_sparse_mla_splitkv_decode_enabled():
+                num_splitkv_splits = choose_sparse_mla_splitkv_splits(
+                    num_tokens=num_decode_tokens,
+                    num_heads=self.num_heads,
+                    num_candidates=total_candidates,
+                    sm_count=num_compute_units(
+                        torch.accelerator.current_device_index()
+                    ),
+                )
+            use_splitkv = num_splitkv_splits > 1
+            workspace_specs = [
+                (
+                    (num_decode_tokens, total_candidates, q.shape[-1]),
+                    torch.bfloat16,
+                ),
+                ((num_decode_tokens, total_candidates), torch.bool),
+            ]
+            if use_splitkv:
+                workspace_specs.append(
+                    (
+                        (
+                            num_decode_tokens,
+                            self.num_heads,
+                            num_splitkv_splits,
+                            q.shape[-1] + 1,
+                        ),
+                        torch.float32,
+                    )
+                )
+            else:
+                workspace_specs.append(
+                    (
+                        (num_decode_tokens, self.num_heads, total_candidates),
+                        torch.bfloat16,
+                    )
+                )
+            (
+                combined_kv,
+                valid_tokens,
+                score_or_mid_buffer,
+            ) = current_workspace_manager().get_simultaneous(*workspace_specs)
+            if mtp_decode:
+                dequantize_global_slots_k_cache(
+                    combined_kv[:, :compressed_topk],
+                    compressed_k_cache,
+                    compressed_slot_ids,
+                    compressed_block_size,
+                )
+                dequantize_global_slots_k_cache(
+                    combined_kv[:, compressed_topk:],
+                    swa_k_cache,
+                    swa_indices,
+                    swa_metadata.block_size,
+                )
+            else:
+                dequantize_combined_sparse_mla_decode_kv(
+                    combined_kv,
+                    compressed_k_cache,
+                    compressed_slot_ids,
+                    compressed_block_size,
+                    swa_k_cache,
+                    swa_metadata.seq_lens[:num_decodes],
+                    swa_lens,
+                    swa_metadata.block_table[:num_decodes],
+                    swa_metadata.block_size,
+                )
+
+            build_combined_sparse_mla_decode_valid_mask(
+                valid_tokens,
+                compressed_slot_ids,
+                topk_lens,
+                swa_lens,
+            )
+            if use_splitkv:
+                splitkv_sparse_mla_attention_with_sink(
+                    q=q,
+                    kv=combined_kv,
+                    valid_tokens=valid_tokens,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    output=output,
+                    mid=score_or_mid_buffer,
+                    num_splits=num_splitkv_splits,
+                    num_heads=self.num_heads,
+                )
+                if output.shape[1] > self.num_heads:
+                    output[:, self.num_heads :].zero_()
+                return
+
+            use_dot_finish = num_decode_tokens <= 16
+            matmul_sparse_mla_attention_with_sink(
+                q=q,
+                kv=combined_kv,
+                valid_tokens=valid_tokens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output,
+                num_heads=self.num_heads,
+                score_buffer=score_or_mid_buffer,
+                value_block_size=512 if use_dot_finish else 256,
+                candidate_block_size=128 if use_dot_finish else None,
+            )
+            return
+
+        if not mtp_decode and compressed_topk <= topk_chunk_size:
+            fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
+                q=q,
+                compressed_k_cache=compressed_k_cache,
+                slot_ids=compressed_slot_ids,
+                topk_lens=topk_lens,
+                compressed_block_size=compressed_block_size,
+                swa_k_cache=swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                swa_block_size=swa_metadata.block_size,
+                num_compressed_candidates=compressed_topk,
+                num_swa_candidates=max_swa_len,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output,
+                head_block_size=head_block_size,
+                num_heads=self.num_heads,
+            )
+            if output.shape[1] > self.num_heads:
+                output[:, self.num_heads :].zero_()
+            return
+
         (
             comp_max_score,
             comp_denom,
