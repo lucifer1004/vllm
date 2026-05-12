@@ -592,7 +592,14 @@ def split_graph(
     # the semantics of the graph will change when we
     # have mutations in the graph
     with _use_lazy_graph_module(True):
-        has_tuple_return = is_torch_equal_or_newer("2.12.0.dev")
+        # `tuple_return=True` ships in torch.fx.passes.split_module with
+        # the 2.12.0 release. Comparing against "2.12.0.dev" treats every
+        # 2.12 pre-release as having the kwarg — including NVIDIA's
+        # PyTorch container nightlies (e.g. 2.12.0a0+nv26.04.X) which are
+        # forked from upstream commits that predate the kwarg's
+        # introduction. Use the released 2.12.0 as the boundary so any
+        # 2.12.0aN/dev/rc still falls through the no-kwarg path.
+        has_tuple_return = is_torch_equal_or_newer("2.12.0")
         tuple_return_kwarg = {"tuple_return": True} if has_tuple_return else {}
         split_gm = torch.fx.passes.split_module.split_module(
             graph,
