@@ -958,15 +958,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         M = N + self.window_size + self.max_num_batched_tokens
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
 
-        # FP8 paged-direct prefill path (sm120 via flash_mla_sm120). When the
-        # backend supports paged FP8 KV cache AND this is a swa-only layer
-        # (no compressed cache), skip the bf16 dequant+gather workspace and
-        # call the kernel directly on `swa_k_cache.unsqueeze(-2)` with
-        # paged-coord SWA indices from swa_metadata.prefill_swa_indices.
-        # Non-swa-only layers (compress_ratio > 1) still take the bf16
-        # workspace path below until dual-cache kernel instantiations land
-        # for the model-specific (topk_main, topk_extra) pair.
-        if flash_mla_sparse_fwd_supports_fp8_kv and swa_only:
+        # FP8 paged-direct prefill path (sm120 via flash_mla_sm120). Skips the
+        # bf16 dequant+gather workspace and the combine_topk_swa_indices step,
+        # passing swa_k_cache.unsqueeze(-2) (and compressed_k_cache.unsqueeze(-2)
+        # for non-swa-only layers) straight to flash_mla_sparse_fwd with
+        # paged-coord indices. The bf16 fallback path below this branch is
+        # incompatible with the sm120 flash_mla_sm120 kernel (which requires
+        # paged FP8 layout, not a flat bf16 workspace), so on sm120 we MUST
+        # take this branch for all layer types.
+        if flash_mla_sparse_fwd_supports_fp8_kv:
             assert swa_metadata.prefill_swa_indices is not None, (
                 "prefill_swa_indices missing — DeepseekSparseSWAMetadataBuilder "
                 "should have populated it for the FP8 paged-direct path"
@@ -976,6 +976,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             # unsqueeze(-2) preserves strides and adds the h_kv=1 axis the
             # kernel expects, matching the _forward_decode shape convention.
             swa_kv_paged = swa_k_cache.unsqueeze(-2)
+            # Compressed cache (non-swa-only). Paged with
+            # block_size = main_block_size / compress_ratio, which the kernel
+            # picks up at runtime via page_block_size_extra dispatch.
+            extra_kv_paged = (
+                compressed_k_cache.unsqueeze(-2)
+                if not swa_only else None
+            )
             for chunk_idx in range(num_chunks):
                 chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
                 chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
@@ -988,6 +995,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     - prefill_token_base
                 )
 
+                extra_indices_chunk = (
+                    topk_indices[query_start:query_end]
+                    if not swa_only else None
+                )
+
                 flash_mla_sparse_fwd(
                     q=q[query_start:query_end],
                     kv=swa_kv_paged,
@@ -995,6 +1007,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     sm_scale=self.scale,
                     attn_sink=self.attn_sink,
                     topk_length=swa_metadata.prefill_swa_lens[query_start:query_end],
+                    extra_k_cache=extra_kv_paged,
+                    extra_indices_in_kvcache=extra_indices_chunk,
                     out=output[query_start:query_end],
                 )
             return
