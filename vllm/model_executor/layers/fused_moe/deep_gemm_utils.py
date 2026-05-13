@@ -38,8 +38,35 @@ def compute_aligned_M(
         )
 
     # expert_num_tokens information is not available on the cpu.
-    # compute the max required size.
-    M_sum = (M * num_topk) + local_num_experts * (alignment - 1)
+    # Compute the max required size as: real tokens + per-expert alignment
+    # padding. At most `min(M*num_topk, local_num_experts)` distinct experts
+    # can actually receive tokens — capping by that avoids 16K-row buffers
+    # at batch=1 decode that would otherwise dominate grouped-GEMM time
+    # (only 6 of 128 experts can be hit by 1 token × topk=6, so the worst-
+    # case 128*(align-1) padding is ~21× too pessimistic).
+    #
+    # Use the per-call *theoretical* alignment from DeepGEMM rather than the
+    # caller-supplied (typically 128) constant: on SM100/SM120 the kernel
+    # can JIT-compile with BLOCK_M ∈ {32, 48, ..., 128}, so for small
+    # expected_m we get a tighter buffer and proportionally less padding
+    # work in the kernel.
+    expected_m = M * num_topk
+    try:
+        from vllm.utils.deep_gemm import (
+            get_theoretical_mk_alignment_for_contiguous_layout,
+        )
+        per_call_align = get_theoretical_mk_alignment_for_contiguous_layout(
+            expected_m=expected_m
+        )
+        # Fall back to caller alignment if the DG helper isn't available
+        # (legacy/older deep_gemm).
+        if per_call_align and per_call_align <= alignment:
+            alignment = per_call_align
+    except Exception:
+        pass
+
+    max_active_experts = min(M * num_topk, local_num_experts)
+    M_sum = (M * num_topk) + max_active_experts * (alignment - 1)
     M_sum = round_up(M_sum, alignment)
     return M_sum
 
