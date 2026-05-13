@@ -72,6 +72,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
+    flash_mla_sparse_fwd_supports_fp8_kv,
     flash_mla_with_kvcache,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -956,6 +957,47 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         M = N + self.window_size + self.max_num_batched_tokens
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+
+        # FP8 paged-direct prefill path (sm120 via flash_mla_sm120). When the
+        # backend supports paged FP8 KV cache AND this is a swa-only layer
+        # (no compressed cache), skip the bf16 dequant+gather workspace and
+        # call the kernel directly on `swa_k_cache.unsqueeze(-2)` with
+        # paged-coord SWA indices from swa_metadata.prefill_swa_indices.
+        # Non-swa-only layers (compress_ratio > 1) still take the bf16
+        # workspace path below until dual-cache kernel instantiations land
+        # for the model-specific (topk_main, topk_extra) pair.
+        if flash_mla_sparse_fwd_supports_fp8_kv and swa_only:
+            assert swa_metadata.prefill_swa_indices is not None, (
+                "prefill_swa_indices missing — DeepseekSparseSWAMetadataBuilder "
+                "should have populated it for the FP8 paged-direct path"
+            )
+            assert swa_metadata.prefill_swa_lens is not None
+            # swa_k_cache: (num_blocks, swa_block_size, head_bytes)
+            # unsqueeze(-2) preserves strides and adds the h_kv=1 axis the
+            # kernel expects, matching the _forward_decode shape convention.
+            swa_kv_paged = swa_k_cache.unsqueeze(-2)
+            for chunk_idx in range(num_chunks):
+                chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
+                chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+                query_start = (
+                    query_start_loc_cpu[num_decodes + chunk_start]
+                    - prefill_token_base
+                )
+                query_end = (
+                    query_start_loc_cpu[num_decodes + chunk_end]
+                    - prefill_token_base
+                )
+
+                flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=swa_kv_paged,
+                    indices=swa_metadata.prefill_swa_indices[query_start:query_end],
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=swa_metadata.prefill_swa_lens[query_start:query_end],
+                    out=output[query_start:query_end],
+                )
+            return
 
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
