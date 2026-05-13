@@ -29,6 +29,25 @@ if current_platform.is_cuda():
 else:
     _flashmla_extension_C_AVAILABLE = False
 
+# SM120 uses an out-of-tree FlashMLA-compatible backend (flash_mla_sm120)
+# because the vendored vllm/third_party/flashmla kernels only target SM90/SM100.
+_flashmla_sm120_AVAILABLE = False
+if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+    try:
+        import flash_mla_sm120  # noqa: F401
+
+        _flashmla_sm120_AVAILABLE = True
+    except ImportError:
+        _flashmla_sm120_AVAILABLE = False
+
+# True when the resolved flash_mla_sparse_fwd accepts paged FP8 KV cache
+# (and the extra_k_cache / extra_indices_in_kvcache / extra_topk_length kwargs
+# for the dual-cache prefill path). On SM120 this is provided by the
+# flash_mla_sm120 backend; the vendored FlashMLA only supports bf16-flat prefill.
+# Callers (e.g. DeepseekV4 _forward_prefill) gate on this flag to choose between
+# the legacy dequantize+gather workspace path and the paged FP8 direct path.
+flash_mla_sparse_fwd_supports_fp8_kv = _flashmla_sm120_AVAILABLE
+
 
 def _is_flashmla_available() -> tuple[bool, str | None]:
     if not _flashmla_C_AVAILABLE:
@@ -64,6 +83,8 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     """
     Return: is_supported_flag, unsupported_reason (optional).
     """
+    if _flashmla_sm120_AVAILABLE:
+        return True, None
     is_available, maybe_reason = _is_flashmla_available()
     if not is_available:
         return False, maybe_reason
@@ -83,7 +104,18 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
     raise RuntimeError(reason or "FlashMLA is not available")
 
 
-if _is_flashmla_available()[0]:
+if _flashmla_sm120_AVAILABLE:
+    from flash_mla_sm120 import (  # noqa: F401
+        FlashMLASchedMeta,
+        flash_mla_sparse_fwd,
+        flash_mla_with_kvcache,
+        get_mla_metadata,
+    )
+
+    flash_attn_varlen_func = _raise_flashmla_unavailable  # type: ignore[assignment]
+    flash_attn_varlen_kvpacked_func = _raise_flashmla_unavailable  # type: ignore[assignment]
+    flash_attn_varlen_qkvpacked_func = _raise_flashmla_unavailable  # type: ignore[assignment]
+elif _is_flashmla_available()[0]:
     from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
         FlashMLASchedMeta,
         flash_attn_varlen_func,

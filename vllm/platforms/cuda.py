@@ -550,7 +550,7 @@ class CudaPlatformBase(Platform):
     @classmethod
     def support_deep_gemm(cls) -> bool:
         """Currently, only Hopper and Blackwell GPUs are supported."""
-        return cls.is_device_capability(90) or cls.is_device_capability_family(100)
+        return cls.is_device_capability(90) or cls.is_device_capability_family(100) or cls.is_device_capability_family(120)
 
     @classmethod
     def is_integrated_gpu(cls, device_id: int = 0) -> bool:
