@@ -5463,6 +5463,7 @@ class GPUModelRunner(
         skip_eplb: bool = False,
         is_profile: bool = False,
         create_mixed_batch: bool = False,
+        create_single_prefill: bool = False,
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
@@ -5526,8 +5527,19 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
+        if create_single_prefill:
             assert not uniform_decode
+            assert not create_mixed_batch
+            # Create a single prefill request with all tokens. Used to warm
+            # prefill-only input-prep Triton kernels (e.g.
+            # `_compute_prefill_metadata_kernel`) that the mixed-batch
+            # warmup misses because max_query_len differs.
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
+            max_query_len = num_tokens
+        elif create_mixed_batch:
+            assert not uniform_decode
+            assert not create_single_prefill
             # Create mixed batch:
             # first half decode tokens, second half one prefill
             num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
@@ -5540,6 +5552,7 @@ class GPUModelRunner(
             max_query_len = num_prefill_tokens
         elif uniform_decode:
             assert not create_mixed_batch
+            assert not create_single_prefill
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
             num_scheduled_tokens_list = [max_query_len] * num_reqs
             if num_tokens % max_query_len != 0:
