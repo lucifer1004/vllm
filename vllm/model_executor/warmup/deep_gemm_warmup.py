@@ -248,7 +248,7 @@ def _get_grouped_gemm_params(
 
     # This is the maximum GroupedGemm M size that we expect to run
     # the grouped_gemm with.
-    MAX_M = compute_aligned_M(
+    MAX_M, _ = compute_aligned_M(
         max_tokens, num_topk, num_experts, block_m, expert_tokens_meta=None
     )
     # Distribute expert-ids evenly.

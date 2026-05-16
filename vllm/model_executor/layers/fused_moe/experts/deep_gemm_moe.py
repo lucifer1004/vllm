@@ -40,6 +40,7 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
     m_grouped_fp8_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
+    mk_alignment_scope,
 )
 from vllm.utils.import_utils import has_deep_gemm
 
@@ -183,10 +184,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         assert self.block_shape is not None
         block_m = self.block_shape[0]
-        M_sum = compute_aligned_M(
+        M_sum, align_used = compute_aligned_M(
             M, topk, local_num_experts, block_m, expert_tokens_meta
         )
-        assert M_sum % block_m == 0
+        assert M_sum % align_used == 0
 
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         workspace1 = (M_sum, max(activation_out_dim, K))
@@ -276,7 +277,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
         assert w2.size(1) == K
 
-        M_sum = compute_aligned_M(
+        M_sum, _ = compute_aligned_M(
             M=topk_ids.size(0),
             num_topk=topk_ids.size(1),
             local_num_experts=local_num_experts,
@@ -287,7 +288,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         a1q_perm = _resize_cache(
             workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, K)
         )
-        a1q, a1q_scale, expert_ids, inv_perm = deepgemm_moe_permute(
+        a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
             aq=a1q,
             aq_scale=a1q_scale,
             topk_ids=topk_ids,
@@ -298,23 +299,29 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         )
         assert a1q.size(0) == M_sum
 
-        mm1_out = _resize_cache(workspace2, (M_sum, N))
-        m_grouped_fp8_gemm_nt_contiguous(
-            (a1q, a1q_scale), (w1, self.w1_scale), mm1_out, expert_ids
-        )
+        # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment.
+        # If BLOCK_M > align_used, the grouped-GEMM scheduler reads
+        # `m_indices[m_block_idx * BLOCK_M]` and lands on the wrong expert's
+        # id — under FULL CUDA-graph replay this surfaces as an IMA on the
+        # B-weights tensor (observed at TP8 + EP + decode).
+        with mk_alignment_scope(align_used):
+            mm1_out = _resize_cache(workspace2, (M_sum, N))
+            m_grouped_fp8_gemm_nt_contiguous(
+                (a1q, a1q_scale), (w1, self.w1_scale), mm1_out, expert_ids
+            )
 
-        activation_out_dim = self.adjust_N_for_activation(N, activation)
-        quant_out = _resize_cache(
-            workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
-        )
-        a2q, a2q_scale = self._act_mul_quant(
-            input=mm1_out.view(-1, N), output=quant_out, activation=activation
-        )
+            activation_out_dim = self.adjust_N_for_activation(N, activation)
+            quant_out = _resize_cache(
+                workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
+            )
+            a2q, a2q_scale = self._act_mul_quant(
+                input=mm1_out.view(-1, N), output=quant_out, activation=activation
+            )
 
-        mm2_out = _resize_cache(workspace2, (M_sum, K))
-        m_grouped_fp8_gemm_nt_contiguous(
-            (a2q, a2q_scale), (w2, self.w2_scale), mm2_out, expert_ids
-        )
+            mm2_out = _resize_cache(workspace2, (M_sum, K))
+            m_grouped_fp8_gemm_nt_contiguous(
+                (a2q, a2q_scale), (w2, self.w2_scale), mm2_out, expert_ids
+            )
 
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
@@ -407,10 +414,10 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         block_m = get_mk_alignment_for_contiguous_layout()[0]
-        M_sum = compute_aligned_M(
+        M_sum, align_used = compute_aligned_M(
             M, topk, local_num_experts, block_m, expert_tokens_meta
         )
-        assert M_sum % block_m == 0
+        assert M_sum % align_used == 0
 
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         workspace1 = (M_sum, max(activation_out_dim, K))
@@ -486,7 +493,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        M_sum = compute_aligned_M(
+        M_sum, _ = compute_aligned_M(
             M=topk_ids.size(0),
             num_topk=topk_ids.size(1),
             local_num_experts=local_num_experts,
@@ -497,7 +504,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         a1q_perm = _resize_cache(
             workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, K)
         )
-        a1q, a1q_scale, expert_ids, inv_perm = deepgemm_moe_permute(
+        a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
             aq=a1q,
             aq_scale=a1q_scale,
             topk_ids=topk_ids,
@@ -508,37 +515,40 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         )
         assert a1q.size(0) == M_sum
 
-        # FC1: FP8 activations x FP4 weights
-        # DeepGEMM 2.4.2 requires FP4-packed weights as int8 (kPackedFP4).
-        mm1_out = _resize_cache(workspace2, (M_sum, N))
-        m_grouped_fp8_fp4_gemm_nt_contiguous(
-            (a1q, a1q_scale),
-            (w1.view(torch.int8), self.w1_scale),
-            mm1_out,
-            expert_ids,
-            recipe_a=(1, self._ACT_BLOCK_K),
-            recipe_b=(1, self._WEIGHT_BLOCK_K),
-        )
+        # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment;
+        # see DeepGemmExperts.apply for rationale.
+        with mk_alignment_scope(align_used):
+            # FC1: FP8 activations x FP4 weights
+            # DeepGEMM 2.4.2 requires FP4-packed weights as int8 (kPackedFP4).
+            mm1_out = _resize_cache(workspace2, (M_sum, N))
+            m_grouped_fp8_fp4_gemm_nt_contiguous(
+                (a1q, a1q_scale),
+                (w1.view(torch.int8), self.w1_scale),
+                mm1_out,
+                expert_ids,
+                recipe_a=(1, self._ACT_BLOCK_K),
+                recipe_b=(1, self._WEIGHT_BLOCK_K),
+            )
 
-        # SwiGLU activation + FP8 requant
-        activation_out_dim = self.adjust_N_for_activation(N, activation)
-        quant_out = _resize_cache(
-            workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
-        )
-        a2q, a2q_scale = self._act_mul_quant(
-            input=mm1_out.view(-1, N), output=quant_out, activation=activation
-        )
+            # SwiGLU activation + FP8 requant
+            activation_out_dim = self.adjust_N_for_activation(N, activation)
+            quant_out = _resize_cache(
+                workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
+            )
+            a2q, a2q_scale = self._act_mul_quant(
+                input=mm1_out.view(-1, N), output=quant_out, activation=activation
+            )
 
-        # FC2: FP8 activations x FP4 weights
-        mm2_out = _resize_cache(workspace2, (M_sum, K))
-        m_grouped_fp8_fp4_gemm_nt_contiguous(
-            (a2q, a2q_scale),
-            (w2.view(torch.int8), self.w2_scale),
-            mm2_out,
-            expert_ids,
-            recipe_a=(1, self._ACT_BLOCK_K),
-            recipe_b=(1, self._WEIGHT_BLOCK_K),
-        )
+            # FC2: FP8 activations x FP4 weights
+            mm2_out = _resize_cache(workspace2, (M_sum, K))
+            m_grouped_fp8_fp4_gemm_nt_contiguous(
+                (a2q, a2q_scale),
+                (w2.view(torch.int8), self.w2_scale),
+                mm2_out,
+                expert_ids,
+                recipe_a=(1, self._ACT_BLOCK_K),
+                recipe_b=(1, self._WEIGHT_BLOCK_K),
+            )
 
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)

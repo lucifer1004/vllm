@@ -29,12 +29,23 @@ def compute_aligned_M(
     local_num_experts: int,
     alignment: int,
     expert_tokens_meta: mk.ExpertTokensMetadata | None,
-):
+) -> tuple[int, int]:
+    """Return (M_sum, alignment_used).
+
+    `alignment_used` may be smaller than the caller-supplied `alignment` on
+    SM100/SM120 when DeepGEMM can JIT a smaller BLOCK_M for the per-call
+    expected_m. Callers that index by block size (e.g. ``M_sum // block_m``)
+    or assert workspace alignment must use the returned `alignment_used`,
+    not their original `alignment` argument.
+    """
     if (expert_tokens_meta is not None) and (
         expert_tokens_meta.expert_num_tokens_cpu is not None
     ):
-        return expert_num_tokens_round_up_and_sum(
-            expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
+        return (
+            expert_num_tokens_round_up_and_sum(
+                expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
+            ),
+            alignment,
         )
 
     # expert_num_tokens information is not available on the cpu.
@@ -68,7 +79,7 @@ def compute_aligned_M(
     max_active_experts = min(M * num_topk, local_num_experts)
     M_sum = (M * num_topk) + max_active_experts * (alignment - 1)
     M_sum = round_up(M_sum, alignment)
-    return M_sum
+    return M_sum, alignment
 
 
 @triton.jit
@@ -79,12 +90,6 @@ def apply_expert_map(expert_id, expert_map):
 
 
 @triton.jit
-def round_up_128(x: int) -> int:
-    y = 128
-    return ((x + y - 1) // y) * y
-
-
-@triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     expert_start_loc,
@@ -92,6 +97,7 @@ def _fwd_kernel_ep_scatter_1(
     num_experts: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_EXPERT_NUM: tl.constexpr,
+    ALIGN_M: tl.constexpr,
 ):
     cur_expert = tl.program_id(0)
 
@@ -101,7 +107,10 @@ def _fwd_kernel_ep_scatter_1(
         mask=offset_cumsum < num_experts,
         other=0,
     )
-    tokens_per_expert = round_up_128(tokens_per_expert)
+    # Round each expert's token count up to ALIGN_M so the cumulative offsets
+    # match the workspace's per-expert slice alignment (set by
+    # compute_aligned_M's chosen alignment).
+    tokens_per_expert = ((tokens_per_expert + ALIGN_M - 1) // ALIGN_M) * ALIGN_M
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
 
     # Extract this block's offset from the register vector (warp shuffle,
@@ -210,8 +219,15 @@ def ep_scatter(
     output_tensor_scale: torch.Tensor,
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
+    align_m: int = 128,
 ):
-    BLOCK_E = 128  # token num of per expert is aligned to 128
+    # Per-expert workspace slices in `output_tensor` are aligned to `align_m`
+    # (typically the alignment chosen by `compute_aligned_M`). The triton
+    # kernel rounds tokens_per_expert up to `align_m` when computing cumulative
+    # offsets so they match the workspace layout. `BLOCK_E` is a separate
+    # static tile size for the m_indices fill loop; it can stay at 128 because
+    # the loop is masked.
+    BLOCK_E = 128
     BLOCK_D = 128  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -219,7 +235,7 @@ def ep_scatter(
     # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
     grid = num_experts
 
-    assert m_indices.shape[0] % BLOCK_E == 0
+    assert m_indices.shape[0] % align_m == 0
     assert expert_start_loc.shape[0] == num_experts
 
     _fwd_kernel_ep_scatter_1[(grid,)](
@@ -230,6 +246,7 @@ def ep_scatter(
         num_warps=num_warps,
         BLOCK_E=BLOCK_E,
         BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+        ALIGN_M=align_m,
     )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
@@ -387,7 +404,7 @@ def deepgemm_moe_permute(
 
     block_m, block_k = get_mk_alignment_for_contiguous_layout()
 
-    M_sum = compute_aligned_M(
+    M_sum, align_used = compute_aligned_M(
         M=topk_ids.size(0),
         num_topk=topk_ids.size(1),
         local_num_experts=local_num_experts,
@@ -439,9 +456,10 @@ def deepgemm_moe_permute(
         output_tensor_scale=aq_scale_out,
         m_indices=expert_ids,
         output_index=inv_perm,
+        align_m=align_used,
     )
 
-    return aq_out, aq_scale_out, expert_ids, inv_perm
+    return aq_out, aq_scale_out, expert_ids, inv_perm, align_used
 
 
 def deepgemm_unpermute_and_reduce(
