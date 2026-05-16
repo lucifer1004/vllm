@@ -151,9 +151,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.head_dim = head_dim
         self.scale = scale
 
-        # FlashMLA sparse kernel only supports 64 or 128 heads; pad up to the
-        # next supported size. Must match DeepseekV4MLAAttention.padded_heads.
-        if num_heads <= 64:
+        # Pad heads to the next FlashMLA-supported MG-kernel size: {32, 64, 128}.
+        # MG path requires NUM_HEADS ≥ 32 (REPLICATE_H = NUM_HEADS / 32 must be
+        # ≥ 1 in dual-cache prefill). Padding TP4 (16) and TP8 (8) up to 32 is
+        # still a big improvement over the previous "always pad to 64" baseline.
+        # Must match DeepseekV4MLAAttention.padded_heads.
+        if num_heads <= 32:
+            self.padded_heads = 32
+        elif num_heads <= 64:
             self.padded_heads = 64
         elif num_heads <= 128:
             self.padded_heads = 128
@@ -615,8 +620,10 @@ direct_register_custom_op(
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
-    # FlashMLA FP8 sparse only supports 64 or 128 heads
-    SUPPORTED_HEAD_COUNTS = (64, 128)
+    # FlashMLA FP8 sparse MG kernel supports h ∈ {32, 64, 128}. The single-cache
+    # SG kernel additionally supports h=16, but the dual-cache prefill (used by
+    # DSv4-Flash SWA + indexer) is MG-only, so we standardize on the MG range.
+    SUPPORTED_HEAD_COUNTS = (32, 64, 128)
 
     def __init__(
         self,
@@ -661,16 +668,19 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        # Determine padded head count for FlashMLA
+        # Determine padded head count for FlashMLA. Supported: {32, 64, 128}.
+        # MG kernel (which handles dual-cache prefill) requires NUM_HEADS ≥ 32.
         if num_heads not in self.SUPPORTED_HEAD_COUNTS:
-            if num_heads < 64:
+            if num_heads <= 32:
+                self.padded_heads = 32
+            elif num_heads < 64:
                 self.padded_heads = 64
             elif num_heads < 128:
                 self.padded_heads = 128
             else:
                 raise ValueError(
                     f"DeepseekV4MLAAttention does not support {num_heads} heads. "
-                    f"Supported: <= 128 (will be padded to 64 or 128)"
+                    f"Supported: <= 128 (will be padded to 32, 64, or 128)"
                 )
         else:
             self.padded_heads = num_heads
