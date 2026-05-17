@@ -490,10 +490,21 @@ def _compute_prefill_metadata_kernel(
     """Compute prefill gather_lens in a single pass."""
     offset = tl.arange(0, BLOCK_SIZE)
     mask = offset < num_prefills
+    # Clamp the offset so the address computed for masked-off lanes still
+    # points inside the seq_lens / query_start_loc allocations. Triton's
+    # mask gates the actual read, but on SM12x with certain Triton-3.6
+    # JIT codegens the address-computation arithmetic alone is enough to
+    # raise an IMA when the masked-off lane's address is past the tensor
+    # end. The caller guarantees num_prefills > 0 (single-pass prefill
+    # metadata is skipped otherwise), so num_prefills - 1 is always a
+    # valid index. query_start_loc is a prefix-sum (num_decodes +
+    # num_prefills + 1 entries) so the `+ 1` form is also in-bounds at
+    # safe_offset = num_prefills - 1.
+    safe_offset = tl.minimum(offset, num_prefills - 1)
 
-    seq_len = tl.load(seq_lens_ptr + num_decodes + offset, mask=mask)
-    qsl_start = tl.load(query_start_loc_ptr + num_decodes + offset, mask=mask)
-    qsl_end = tl.load(query_start_loc_ptr + num_decodes + offset + 1, mask=mask)
+    seq_len = tl.load(seq_lens_ptr + num_decodes + safe_offset, mask=mask)
+    qsl_start = tl.load(query_start_loc_ptr + num_decodes + safe_offset, mask=mask)
+    qsl_end = tl.load(query_start_loc_ptr + num_decodes + safe_offset + 1, mask=mask)
 
     query_len = qsl_end - qsl_start
     prefix_len = seq_len - query_len
