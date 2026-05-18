@@ -295,22 +295,25 @@ def get_mk_alignment_for_contiguous_layout() -> list[int]:
 
 def get_theoretical_mk_alignment_for_contiguous_layout(
     expected_m: int | None = None,
+    num_groups: int | None = None,
 ) -> int:
     """Per-call optimal M alignment for grouped contiguous GEMMs.
 
-    On SM100/SM120 the kernel can JIT-compile with BLOCK_M ∈ {32, 48, ..., 128}
-    in MMA_M=16 steps. Smaller BLOCK_M reduces grouped-GEMM padding waste
-    at small expected_m (e.g., MoE decode at batch=1, where m_total = topk
-    × batch is tiny and one full aligned block per expert is mostly empty).
+    `expected_m` is the TOTAL routed tokens (sum across experts, typically
+    M × num_topk). `num_groups` is the number of experts on this rank.
+    The helper divides to recover per-expert em and picks an alignment based
+    on data-driven thresholds (see deep_gemm runtime.hpp comments).
 
-    Callers (e.g., `compute_aligned_M`) should pass `expected_m` so the
-    returned alignment matches the BLOCK_M the kernel will actually pick
-    at JIT time for that shape.
+    Older callers that omit `num_groups` are interpreted as passing already
+    per-expert em (legacy behaviour preserved for backward compat).
     """
     _lazy_init()
     if _get_theoretical_mk_alignment_for_contiguous_layout_impl is None:
         return _missing()
-    return _get_theoretical_mk_alignment_for_contiguous_layout_impl(expected_m)
+    # The C++ binding accepts both as Optional[int]. Pass through.
+    return _get_theoretical_mk_alignment_for_contiguous_layout_impl(
+        expected_m, num_groups
+    )
 
 
 def set_mk_alignment_for_contiguous_layout(value: int) -> None:

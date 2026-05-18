@@ -66,8 +66,14 @@ def compute_aligned_M(
         from vllm.utils.deep_gemm import (
             get_theoretical_mk_alignment_for_contiguous_layout,
         )
+        # Pass num_groups=local_num_experts so the heuristic recovers
+        # per-expert em (= expected_m / num_groups). Without this the
+        # heuristic treats `expected_m` as already per-expert and over-picks
+        # BLOCK_M for prefill workloads on SM120
+        # (see DeepGEMM/csrc/jit_kernels/heuristics/runtime.hpp).
         per_call_align = get_theoretical_mk_alignment_for_contiguous_layout(
-            expected_m=expected_m
+            expected_m=expected_m,
+            num_groups=local_num_experts,
         )
         # Fall back to caller alignment if the DG helper isn't available
         # (legacy/older deep_gemm).

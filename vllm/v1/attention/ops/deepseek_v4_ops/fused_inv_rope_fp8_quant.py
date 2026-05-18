@@ -38,9 +38,23 @@ def _fused_inv_rope_fp8_quant_per_head(
     HALF_ROPE: tl.constexpr,
     TMA_ALIGNED_SCALES: tl.constexpr,
 ):
-    # int64: stride multiply overflows int32 past num_tokens=32768 (IMA).
+    # Force every address-arithmetic operand to int64. Casting only
+    # `pid_token`/`pid_gh` is insufficient: when the runtime strides are passed
+    # as Python ints, Triton infers them as int32, and the multiplication
+    # `pid_token(int64) × stride(int32)` can be lowered to int32 arithmetic
+    # under some JIT-time codegen paths — wrapping past int32 max for
+    # combinations like pid_token=8191 × fp8_stride_token=O(s72·d). Observed
+    # as IMA at TP=4/8 with batched prefill packing where the effective stride
+    # crosses ~2³¹. Casting the strides explicitly makes every product int64.
     pid_token = tl.program_id(0).to(tl.int64)
     pid_gh = tl.program_id(1).to(tl.int64)
+    o_stride_token = o_stride_token.to(tl.int64)
+    o_stride_head = o_stride_head.to(tl.int64)
+    cache_stride_pos = cache_stride_pos.to(tl.int64)
+    fp8_stride_group = fp8_stride_group.to(tl.int64)
+    fp8_stride_token = fp8_stride_token.to(tl.int64)
+    scale_stride_group = scale_stride_group.to(tl.int64)
+    scale_stride_k = scale_stride_k.to(tl.int64)
 
     g = pid_gh // heads_per_group
     head_in_group = pid_gh % heads_per_group
