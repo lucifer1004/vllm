@@ -530,8 +530,7 @@ class BaseOAITritonExperts(mk.FusedMoEExpertsModular):
         cap = p.get_device_capability()
         if cap is None:
             return False
-        # (9,0) <= cap < (11,0) covers CUDA SM90 (Hopper), SM100+ (Blackwell)
-        # and ROCm gfx942/gfx950 (which map to 9.4/9.5).
+        # cap < (11,0) covers Hopper/Blackwell and ROCm gfx942/gfx950 (=9.4/9.5).
         if not has_triton_kernels():
             return False
         return (9, 0) <= (cap.major, cap.minor) < (11, 0)
@@ -944,8 +943,7 @@ class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         cap = p.get_device_capability()
         if cap is None:
             return False
-        # (9,0) <= cap < (11,0) covers CUDA SM90 (Hopper), SM100+ (Blackwell)
-        # and ROCm gfx942/gfx950 (which map to 9.4/9.5).
+        # cap < (11,0) covers Hopper/Blackwell and ROCm gfx942/gfx950 (=9.4/9.5).
         if not has_triton_kernels():
             return False
         return (9, 0) <= (cap.major, cap.minor) < (11, 0)

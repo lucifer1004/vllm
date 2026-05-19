@@ -23,8 +23,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Backends that use the DSv4 sparse-MLA path on SM12x. The cold-JIT IMA we
-# fix here is specific to these backends' input-prep kernels.
 _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
     {
         "FLASHMLA_SPARSE",
@@ -32,19 +30,13 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
     }
 )
 
-# Mixed prefill+decode shape used to JIT the attention-side input-prep
-# kernels (e.g. `_compute_swa_indices_and_lens_kernel`).
 _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = 16
-
-# Single-chunk prefill at the scheduler's max batched-token budget.
-# Covers the canonical SM12x serve config (max_num_batched_tokens=8192);
-# `_clamp_warmup_tokens` clamps down for smaller caps.
 _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 8192
 
-# Slot-mapping kernel `_compute_slot_mapping_kernel` JIT-specializes on
-# num_tokens; warm a fan of sizes so the first real decode request never
-# hits a fresh JIT compile (which on SM12x can produce non-deterministic
-# codegen that writes wrong slot_mapping → KV corruption → IMA).
+# Fan of num_tokens specializations to pre-JIT for
+# `_compute_slot_mapping_kernel`. On SM12x cold JIT can emit
+# non-deterministic codegen that writes wrong slot_mapping → KV corruption
+# → downstream sparse-MLA IMA.
 _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     32,
     64,
@@ -78,21 +70,11 @@ def _clamp_warmup_tokens(num_tokens: int, max_tokens: int) -> int:
 
 
 def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
-    """Warm `block_table.compute_slot_mapping` across a fan of token counts.
-
-    The underlying Triton `_compute_slot_mapping_kernel` JIT-specializes on
-    num_tokens; on SM12x with non-deterministic codegen, the first compile
-    can produce a kernel that writes wrong slot_mapping → KV cache
-    corruption → downstream sparse-MLA reads OOB → IMA at
-    `flash_mla_sparse_fwd`. Pre-JIT all the shapes the scheduler will ever
-    issue during steady-state decode so the first real request runs the
-    cached kernel.
-    """
+    """Pre-JIT `_compute_slot_mapping_kernel` across decode-shaped sizes."""
     max_tokens = getattr(runner, "max_num_tokens", 1)
     block_table = runner.input_batch.block_table
 
-    # Snapshot the runner buffers we mutate so warmup never leaks state into
-    # the first real request.
+    # Snapshot the runner buffers we mutate so warmup doesn't leak state.
     saved_query_start_loc_np = None
     saved_query_start_loc_gpu = None
     if hasattr(runner, "query_start_loc"):
@@ -159,21 +141,9 @@ def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
 def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     """Warm sparse-MLA attention shapes via `_dummy_run`.
 
-    Runs the model forward with synthetic batches matching the canonical
-    serve shapes:
-    1. Mixed prefill+decode (16 tokens) — warms shared attention paths
-       (`_compute_swa_indices_and_lens_kernel`, indexer KV-insert, ...)
-    2. Single max-chunk prefill (8K tokens) — warms prefill-only kernels
-       (`_compute_prefill_metadata_kernel`, `_save_partial_states_kernel`,
-       `_fused_kv_compress_norm_rope_insert_*`)
-    3. 2nd-chunk prefill with prior context (8K curr + 8K prior) — warms
-       the alt-shape `_build_prefill_chunk_metadata_kernel` codepath the
-       indexer hits when a chunked prefill is not the first chunk.
-
-    Both prefill calls use `create_single_prefill=True` so `_dummy_run`
-    builds a single-request batch with `max_query_len == num_tokens`
-    (mixed-batch warmup uses a different `max_query_len` and so misses
-    these kernel specializations).
+    Three shapes: mixed prefill+decode, single max-chunk prefill, and a
+    second-chunk prefill (prior context) — the last covers
+    `_build_prefill_chunk_metadata_kernel`'s alt-shape specialization.
     """
     if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
         return
@@ -214,11 +184,8 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
             force_attention=True,
             create_single_prefill=True,
         )
-        # Simulate the second-and-later chunk of a chunked prefill so the
-        # alt-shape `_build_prefill_chunk_metadata_kernel` codepath that
-        # fires when the indexer sees prior context gets JIT-compiled
-        # here, not on the first user request that exceeds
-        # `max_num_batched_tokens`.
+        # Second-chunk shape: indexer sees prior context, hits the alt
+        # specialization of `_build_prefill_chunk_metadata_kernel`.
         runner._dummy_run(
             num_tokens=prefill_tokens,
             skip_eplb=True,
@@ -230,9 +197,7 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
 
 
 def kernel_warmup(worker: "Worker"):
-    # DeepSeek V4 sparse-MLA warmup runs first so the slot-mapping kernel
-    # and attention input-prep kernels are JIT'd against the runner's
-    # pristine state, before DG/FlashInfer warmup mutate it.
+    # Run first so input-prep kernels JIT against pristine runner state.
     _deepseek_v4_sparse_mla_attention_warmup(worker)
     _deepseek_v4_request_prep_warmup(worker)
 

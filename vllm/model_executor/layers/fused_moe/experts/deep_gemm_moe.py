@@ -299,11 +299,8 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         )
         assert a1q.size(0) == M_sum
 
-        # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment.
-        # If BLOCK_M > align_used, the grouped-GEMM scheduler reads
-        # `m_indices[m_block_idx * BLOCK_M]` and lands on the wrong expert's
-        # id — under FULL CUDA-graph replay this surfaces as an IMA on the
-        # B-weights tensor (observed at TP8 + EP + decode).
+        # BLOCK_M > align_used → grouped-GEMM scheduler picks wrong expert id
+        # from m_indices, surfaces as IMA on B-weights under cudagraph replay.
         with mk_alignment_scope(align_used):
             mm1_out = _resize_cache(workspace2, (M_sum, N))
             m_grouped_fp8_gemm_nt_contiguous(

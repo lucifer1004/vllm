@@ -29,8 +29,7 @@ if current_platform.is_cuda():
 else:
     _flashmla_extension_C_AVAILABLE = False
 
-# SM120 uses an out-of-tree FlashMLA-compatible backend (flash_mla_sm120)
-# because the vendored vllm/third_party/flashmla kernels only target SM90/SM100.
+# Out-of-tree FlashMLA backend for SM120 (vendored kernels target SM90/SM100 only).
 _flashmla_sm120_AVAILABLE = False
 if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
     try:
@@ -40,12 +39,8 @@ if current_platform.is_cuda() and current_platform.is_device_capability_family(1
     except ImportError:
         _flashmla_sm120_AVAILABLE = False
 
-# True when the resolved flash_mla_sparse_fwd accepts paged FP8 KV cache
-# (and the extra_k_cache / extra_indices_in_kvcache / extra_topk_length kwargs
-# for the dual-cache prefill path). On SM120 this is provided by the
-# flash_mla_sm120 backend; the vendored FlashMLA only supports bf16-flat prefill.
-# Callers (e.g. DeepseekV4 _forward_prefill) gate on this flag to choose between
-# the legacy dequantize+gather workspace path and the paged FP8 direct path.
+# Gates DSv4 _forward_prefill between paged FP8 direct (sm120) and the
+# bf16 dequant+gather workspace fallback (vendored FlashMLA).
 flash_mla_sparse_fwd_supports_fp8_kv = _flashmla_sm120_AVAILABLE
 
 

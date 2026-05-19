@@ -1272,11 +1272,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_USING_PATHWAYS": lambda: bool(
         "proxy" in os.getenv("JAX_PLATFORMS", "").lower()
     ),
-    # Enable DeepSeek V4 sparse-MLA warmup to pre-JIT the 10 input-prep
-    # Triton kernels (compute_slot_mapping, build_prefill_chunk_metadata,
-    # save_partial_states, ...). Closes a cold-JIT IMA window on SM12x
-    # where non-deterministic Triton codegen on first compile writes wrong
-    # slot_mapping → KV corruption → flash_mla_sparse_fwd IMA.
+    # Pre-JIT DSv4 sparse-MLA input-prep kernels to close a cold-JIT IMA
+    # window on SM12x.
     "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP": lambda: bool(
         int(os.getenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "1"))
     ),

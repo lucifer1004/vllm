@@ -665,17 +665,9 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
     """Convert loaded weights into backend-specific kernel format."""
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
-        # MXFP4 weight scales are stored as UE8M0 (1 B/elem) in the
-        # checkpoint. DeepGEMM's SM100/SM120 FP8/FP4 grouped kernels accept
-        # scales as either fp32 (legacy, 4 B/elem) or packed int32
-        # (4 UE8M0 → 1 int32, 1 B/elem net — 4× smaller than fp32). The
-        # previous path stored fp32 and consumed ~13 GiB extra per rank
-        # for DeepSeek-V4-Flash's 256-expert MoE, pushing KV cache OOM.
-        #
-        # Mirror the FP8 linear path (`deepgemm_post_process_fp8_weight_block`):
-        # upcast to fp32 for the transform input, then call
-        # `transform_sf_into_required_layout` which packs into the
-        # TMA-aligned int32 UE8M0 layout the kernel consumes directly.
+        # Pack UE8M0 scales into the int32 layout DeepGEMM's SM100/SM120
+        # kernels consume directly. The fp32 legacy layout is 4× larger and
+        # spills ~13 GiB/rank on DSv4-Flash's 256-expert MoE.
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
         )
@@ -1179,11 +1171,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     """
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
-        # Weights stay as uint8 packed FP4 — no layout change needed.
-        # Pack UE8M0 (1 B/elem) scales into the TMA-aligned int32 layout
-        # DeepGEMM's SM100/SM120 grouped FP8/FP4 kernels consume directly.
-        # The legacy fp32 path is 4× larger and consumes ~13 GiB extra
-        # per rank for DeepSeek-V4-Flash's 256-expert MoE.
+        # Pack UE8M0 scales into the int32 layout (see DEEPGEMM_MXFP4 branch
+        # above for the rationale).
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
         )

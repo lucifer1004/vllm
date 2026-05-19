@@ -151,12 +151,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.head_dim = head_dim
         self.scale = scale
 
-        # Pad heads to the next FlashMLA-supported MG-kernel size: {32, 64, 128}.
-        # MG path requires NUM_HEADS ≥ 32 (REPLICATE_H = NUM_HEADS / 32 must be
-        # ≥ 1 in dual-cache prefill). Padding TP4 (16) and TP8 (8) up to 32 is
-        # still a big improvement over the previous "always pad to 64" baseline.
         # Must match DeepseekV4MLAAttention.padded_heads.
-        if num_heads <= 32:
+        if num_heads <= 16:
+            self.padded_heads = 16
+        elif num_heads <= 32:
             self.padded_heads = 32
         elif num_heads <= 64:
             self.padded_heads = 64
@@ -620,10 +618,7 @@ direct_register_custom_op(
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
-    # FlashMLA FP8 sparse MG kernel supports h ∈ {32, 64, 128}. The single-cache
-    # SG kernel additionally supports h=16, but the dual-cache prefill (used by
-    # DSv4-Flash SWA + indexer) is MG-only, so we standardize on the MG range.
-    SUPPORTED_HEAD_COUNTS = (32, 64, 128)
+    SUPPORTED_HEAD_COUNTS = (16, 32, 64, 128)
 
     def __init__(
         self,
@@ -668,10 +663,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        # Determine padded head count for FlashMLA. Supported: {32, 64, 128}.
-        # MG kernel (which handles dual-cache prefill) requires NUM_HEADS ≥ 32.
         if num_heads not in self.SUPPORTED_HEAD_COUNTS:
-            if num_heads <= 32:
+            if num_heads <= 16:
+                self.padded_heads = 16
+            elif num_heads <= 32:
                 self.padded_heads = 32
             elif num_heads < 64:
                 self.padded_heads = 64
@@ -680,7 +675,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 raise ValueError(
                     f"DeepseekV4MLAAttention does not support {num_heads} heads. "
-                    f"Supported: <= 128 (will be padded to 32, 64, or 128)"
+                    f"Supported: <= 128 (will be padded to 16, 32, 64, or 128)"
                 )
         else:
             self.padded_heads = num_heads
@@ -924,7 +919,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
-        swa_only = attn_metadata is None
+        # `_dummy_run` passes synthetic non-None attn_metadata for swa-only
+        # layers during cudagraph capture, so check compress_ratio directly.
+        swa_only = self.compress_ratio <= 1
 
         num_prefills = swa_metadata.num_prefills
         num_prefill_tokens = swa_metadata.num_prefill_tokens
@@ -968,27 +965,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         M = N + self.window_size + self.max_num_batched_tokens
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
 
-        # FP8 paged-direct prefill path (sm120 via flash_mla_sm120). Skips the
-        # bf16 dequant+gather workspace and the combine_topk_swa_indices step,
-        # passing swa_k_cache.unsqueeze(-2) (and compressed_k_cache.unsqueeze(-2)
-        # for non-swa-only layers) straight to flash_mla_sparse_fwd with
-        # paged-coord indices. The bf16 fallback path below this branch is
-        # incompatible with the sm120 flash_mla_sm120 kernel (which requires
-        # paged FP8 layout, not a flat bf16 workspace), so on sm120 we MUST
-        # take this branch for all layer types.
+        # FP8 paged-direct prefill (sm120). The bf16 dequant+gather fallback
+        # below is incompatible with flash_mla_sm120 (requires paged FP8), so
+        # sm120 must take this branch for all layer types.
         if flash_mla_sparse_fwd_supports_fp8_kv:
-            assert swa_metadata.prefill_swa_indices is not None, (
-                "prefill_swa_indices missing — DeepseekSparseSWAMetadataBuilder "
-                "should have populated it for the FP8 paged-direct path"
-            )
+            assert swa_metadata.prefill_swa_indices is not None
             assert swa_metadata.prefill_swa_lens is not None
-            # swa_k_cache: (num_blocks, swa_block_size, head_bytes)
-            # unsqueeze(-2) preserves strides and adds the h_kv=1 axis the
-            # kernel expects, matching the _forward_decode shape convention.
+            # unsqueeze(-2) adds the h_kv=1 axis without copying.
             swa_kv_paged = swa_k_cache.unsqueeze(-2)
-            # Compressed cache (non-swa-only). Paged with
-            # block_size = main_block_size / compress_ratio, which the kernel
-            # picks up at runtime via page_block_size_extra dispatch.
             extra_kv_paged = (
                 compressed_k_cache.unsqueeze(-2)
                 if not swa_only else None

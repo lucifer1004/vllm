@@ -5530,10 +5530,8 @@ class GPUModelRunner(
         if create_single_prefill:
             assert not uniform_decode
             assert not create_mixed_batch
-            # Create a single prefill request with all tokens. Used to warm
-            # prefill-only input-prep Triton kernels (e.g.
-            # `_compute_prefill_metadata_kernel`) that the mixed-batch
-            # warmup misses because max_query_len differs.
+            # Single-prefill batch (max_query_len == num_tokens) — warms
+            # specializations the mixed-batch shape misses.
             num_reqs = 1
             num_scheduled_tokens_list = [num_tokens]
             max_query_len = num_tokens

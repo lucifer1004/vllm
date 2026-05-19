@@ -48,35 +48,23 @@ def compute_aligned_M(
             alignment,
         )
 
-    # expert_num_tokens information is not available on the cpu.
-    # Compute the max required size as: real tokens + per-expert alignment
-    # padding. At most `min(M*num_topk, local_num_experts)` distinct experts
-    # can actually receive tokens — capping by that avoids 16K-row buffers
-    # at batch=1 decode that would otherwise dominate grouped-GEMM time
-    # (only 6 of 128 experts can be hit by 1 token × topk=6, so the worst-
-    # case 128*(align-1) padding is ~21× too pessimistic).
-    #
-    # Use the per-call *theoretical* alignment from DeepGEMM rather than the
-    # caller-supplied (typically 128) constant: on SM100/SM120 the kernel
-    # can JIT-compile with BLOCK_M ∈ {32, 48, ..., 128}, so for small
-    # expected_m we get a tighter buffer and proportionally less padding
-    # work in the kernel.
+    # expert_num_tokens not on cpu. Cap padding by min(M*num_topk,
+    # local_num_experts) — at batch=1 decode only `num_topk` experts can be
+    # active, so the worst-case `local_num_experts*(align-1)` is too loose.
+    # Also shrink `alignment` to DeepGEMM's per-call theoretical BLOCK_M on
+    # SM100/SM120 when smaller.
     expected_m = M * num_topk
     try:
         from vllm.utils.deep_gemm import (
             get_theoretical_mk_alignment_for_contiguous_layout,
         )
-        # Pass num_groups=local_num_experts so the heuristic recovers
-        # per-expert em (= expected_m / num_groups). Without this the
-        # heuristic treats `expected_m` as already per-expert and over-picks
-        # BLOCK_M for prefill workloads on SM120
-        # (see DeepGEMM/csrc/jit_kernels/heuristics/runtime.hpp).
+        # num_groups=local_num_experts so the helper recovers per-expert em;
+        # omitting it over-picks BLOCK_M on SM120 (heuristic assumes em is
+        # already per-expert).
         per_call_align = get_theoretical_mk_alignment_for_contiguous_layout(
             expected_m=expected_m,
             num_groups=local_num_experts,
         )
-        # Fall back to caller alignment if the DG helper isn't available
-        # (legacy/older deep_gemm).
         if per_call_align and per_call_align <= alignment:
             alignment = per_call_align
     except Exception:
@@ -113,9 +101,7 @@ def _fwd_kernel_ep_scatter_1(
         mask=offset_cumsum < num_experts,
         other=0,
     )
-    # Round each expert's token count up to ALIGN_M so the cumulative offsets
-    # match the workspace's per-expert slice alignment (set by
-    # compute_aligned_M's chosen alignment).
+    # Round up to ALIGN_M so cumsum matches the workspace's per-expert slices.
     tokens_per_expert = ((tokens_per_expert + ALIGN_M - 1) // ALIGN_M) * ALIGN_M
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
 
@@ -227,12 +213,7 @@ def ep_scatter(
     output_index: torch.Tensor,
     align_m: int = 128,
 ):
-    # Per-expert workspace slices in `output_tensor` are aligned to `align_m`
-    # (typically the alignment chosen by `compute_aligned_M`). The triton
-    # kernel rounds tokens_per_expert up to `align_m` when computing cumulative
-    # offsets so they match the workspace layout. `BLOCK_E` is a separate
-    # static tile size for the m_indices fill loop; it can stay at 128 because
-    # the loop is masked.
+    # BLOCK_E is the m_indices fill-loop tile (masked), independent of align_m.
     BLOCK_E = 128
     BLOCK_D = 128  # block size of quantization
     num_warps = 8

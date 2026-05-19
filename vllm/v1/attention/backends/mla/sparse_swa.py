@@ -158,12 +158,7 @@ class DeepseekSparseSWAMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, window_size]
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
-    # Paged-coordinate SWA indices for the prefill portion of the batch.
-    # Populated by the same _compute_swa_indices_and_lens_kernel that fills
-    # the decode buffers, applied to the prefill token range. Used by the
-    # paged FP8 direct path (deepseek_v4_attention._forward_prefill on
-    # sm120 via flash_mla_sm120) so we can skip dequantize_and_gather_k_cache
-    # and pass swa_k_cache.unsqueeze(-2) straight to flash_mla_sparse_fwd.
+    # Paged-coordinate prefill SWA indices/lens (FP8 paged-direct prefill).
     prefill_swa_indices: torch.Tensor | None = None  # [num_prefill_tokens, 1, window_size]
     prefill_swa_lens: torch.Tensor | None = None    # [num_prefill_tokens]
 
@@ -260,12 +255,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        # Same shape/dtype as decode_swa_indices/decode_swa_lens. Sized for
-        # the full token budget so a prefill-heavy step has room for every
-        # prefill token. Allocated unconditionally because the consumer
-        # (deepseek_v4_attention._forward_prefill) chooses the path at
-        # call time; if the bf16 dequant+gather path is used the buffers
-        # are simply unread.
+        # Allocated unconditionally — consumer picks paged-direct vs dequant
+        # at call time.
         self.prefill_swa_indices = torch.zeros(
             max_tokens,
             1,
@@ -340,12 +331,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 TRITON_BLOCK_SIZE=1024,
             )
 
-        # Prefill SWA indices live in paged coordinates (slot_id =
-        # block_number * block_size + slot_offset). The same Triton kernel
-        # handles any token range — pass `token_offset=num_decode_tokens`
-        # so the kernel reads is_valid_token / token_to_req_indices at the
-        # absolute prefill positions while writing output starting at
-        # index 0 of the prefill buffer.
         if num_prefill_tokens > 0:
             prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
@@ -490,16 +475,9 @@ def _compute_prefill_metadata_kernel(
     """Compute prefill gather_lens in a single pass."""
     offset = tl.arange(0, BLOCK_SIZE)
     mask = offset < num_prefills
-    # Clamp the offset so the address computed for masked-off lanes still
-    # points inside the seq_lens / query_start_loc allocations. Triton's
-    # mask gates the actual read, but on SM12x with certain Triton-3.6
-    # JIT codegens the address-computation arithmetic alone is enough to
-    # raise an IMA when the masked-off lane's address is past the tensor
-    # end. The caller guarantees num_prefills > 0 (single-pass prefill
-    # metadata is skipped otherwise), so num_prefills - 1 is always a
-    # valid index. query_start_loc is a prefix-sum (num_decodes +
-    # num_prefills + 1 entries) so the `+ 1` form is also in-bounds at
-    # safe_offset = num_prefills - 1.
+    # SM12x + Triton 3.6 raises IMA on out-of-bounds address arithmetic for
+    # masked-off lanes even though the load mask gates the actual read, so
+    # clamp the offset. Caller guarantees num_prefills > 0.
     safe_offset = tl.minimum(offset, num_prefills - 1)
 
     seq_len = tl.load(seq_lens_ptr + num_decodes + safe_offset, mask=mask)
@@ -529,13 +507,8 @@ def _compute_swa_indices_and_lens_kernel(
     token_offset,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
-    # `pid` indexes the output buffer (caller-relative); `token_idx` is the
-    # absolute global token index used to look up token_to_req_indices /
-    # is_valid_token and to compute the intra-sequence query position via
-    # `token_idx - query_start`. For decode-only callers token_offset == 0
-    # and pid == token_idx; for the prefill call token_offset ==
-    # num_decode_tokens and output writes still use pid so the prefill
-    # buffer starts at index 0.
+    # `pid` indexes the output buffer (0-based per buffer); `token_idx` is
+    # the absolute global token index used for inputs.
     pid = tl.program_id(0)
     token_idx = pid + token_offset
     is_valid = tl.load(is_valid_token_ptr + token_idx)
