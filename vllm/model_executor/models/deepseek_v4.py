@@ -963,10 +963,12 @@ class DeepseekV4Attention(nn.Module):
         self.eps = config.rms_norm_eps
         self.max_position_embeddings = config.max_position_embeddings
 
-        # Padded to next FlashMLA-supported head count ({32, 64, 128}),
+        # Padded to next FlashMLA-supported head count ({16, 32, 64, 128}),
         # initialized to -inf so padded slots contribute no sink effect.
         # Must match DeepseekV4MLAAttention.padded_heads.
-        if self.n_local_heads <= 32:
+        if self.n_local_heads <= 16:
+            padded_heads = 16
+        elif self.n_local_heads <= 32:
             padded_heads = 32
         elif self.n_local_heads <= 64:
             padded_heads = 64

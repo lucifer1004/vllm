@@ -151,14 +151,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.head_dim = head_dim
         self.scale = scale
 
-        # Must match DeepseekV4MLAAttention.padded_heads. Pad floor is 32 —
-        # the NUM_HEADS=16 dual-cache kernel path (sparse_mla_sm120
-        # MG_N_HG_T=1) has a precision bug at PAGE_BLOCK_SIZE_EXTRA=64 (C4A
-        # layers): driver-replay against captured TP=4 shapes shows ULP
-        # 40-100 vs reference, NaN-before-attn_sink, in ~30% of output
-        # tokens. C128A and single-cache paths are clean. Revert here until
-        # the kernel is fixed; track in sparse_mla_sm120 follow-up.
-        if num_heads <= 32:
+        # Must match DeepseekV4MLAAttention.padded_heads.
+        if num_heads <= 16:
+            self.padded_heads = 16
+        elif num_heads <= 32:
             self.padded_heads = 32
         elif num_heads <= 64:
             self.padded_heads = 64
@@ -622,10 +618,7 @@ direct_register_custom_op(
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
-    # 16 omitted: sparse_mla_sm120 MG_N_HG_T=1 + PAGE_BLOCK_SIZE_EXTRA=64
-    # path (C4A dual-cache at num_heads=16) has a precision bug; see
-    # padded_heads comment in DeepseekV4MultiHeadLatentAttentionWrapper.
-    SUPPORTED_HEAD_COUNTS = (32, 64, 128)
+    SUPPORTED_HEAD_COUNTS = (16, 32, 64, 128)
 
     def __init__(
         self,
@@ -671,7 +664,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         if num_heads not in self.SUPPORTED_HEAD_COUNTS:
-            if num_heads <= 32:
+            if num_heads <= 16:
+                self.padded_heads = 16
+            elif num_heads <= 32:
                 self.padded_heads = 32
             elif num_heads < 64:
                 self.padded_heads = 64
@@ -680,7 +675,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 raise ValueError(
                     f"DeepseekV4MLAAttention does not support {num_heads} heads. "
-                    f"Supported: <= 128 (will be padded to 32, 64, or 128)"
+                    f"Supported: <= 128 (will be padded to 16, 32, 64, or 128)"
                 )
         else:
             self.padded_heads = num_heads
