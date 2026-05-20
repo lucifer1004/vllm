@@ -72,6 +72,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
+    BatchSparseMLAPagedAttentionWrapper,
     flash_mla_sparse_fwd,
     flash_mla_sparse_fwd_supports_fp8_kv,
     flash_mla_with_kvcache,
@@ -689,6 +690,21 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         assert swa_cache_layer is not None
         self.swa_cache_layer: DeepseekV4SWACache = swa_cache_layer
 
+        # Plan/run wrapper for sm120 sparse-MLA. Construction is cheap
+        # (no GPU work); plan() is called per step inside the forward
+        # path with the actual per-step topk shapes. When this kernel
+        # family migrates upstream to FlashInfer, the import target
+        # changes (`flashinfer.BatchSparseMLAPagedAttentionWrapper`) but
+        # this construction and the run-site call stay the same.
+        # On non-sm120 platforms the stub wrapper raises at __init__,
+        # so we only construct it when the sm120 sparse fast path is
+        # active.
+        self._sparse_mla_wrapper: BatchSparseMLAPagedAttentionWrapper | None
+        if flash_mla_sparse_fwd_supports_fp8_kv:
+            self._sparse_mla_wrapper = BatchSparseMLAPagedAttentionWrapper()
+        else:
+            self._sparse_mla_wrapper = None
+
         # Get vllm config for cache setup
         vllm_config = get_current_vllm_config()
         self.max_num_batched_tokens = (
@@ -893,23 +909,51 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             "allocate one for this layer type."
         )
 
-        out, _ = flash_mla_with_kvcache(
-            q=q,
-            k_cache=swa_cache,
-            block_table=None,
+        # Plan/run via the wrapper (`BatchSparseMLAPagedAttentionWrapper`)
+        # — the FlashInfer-style canonical interface. plan() captures the
+        # per-step layer config (cheap: no GPU work); run() dispatches
+        # through ``sparse_mla_fwd`` to either ``sparse_mla_decode_v2_fwd``
+        # (num_tokens ≤ 64) or ``sparse_mla_prefill_fwd`` (larger).
+        assert self._sparse_mla_wrapper is not None, (
+            "DeepseekV4 attention requires the sm120 sparse-MLA backend; "
+            "_sparse_mla_wrapper should have been constructed in __init__."
+        )
+        extra_topk = (
+            topk_indices.shape[-1] if topk_indices is not None else 0
+        )
+        # When the extra cache is engaged, its page block size is
+        # main_block_size / compress_ratio (DSv4 compressed-cache layout).
+        page_size_extra = (
+            attn_metadata.block_size // self.compress_ratio
+            if (not swa_only and attn_metadata is not None)
+            else None
+        )
+        self._sparse_mla_wrapper.plan(
+            num_heads=q.size(-2),
+            head_dim_qk=q.size(-1),
             head_dim_v=512,
-            tile_scheduler_metadata=tile_metadata,
-            cache_seqlens=None,
-            is_fp8_kvcache=True,
-            indices=swa_indices,
-            topk_length=swa_lens,
-            softmax_scale=self.scale,
+            page_size=swa_cache.size(-3),
+            topk=swa_indices.size(-1),
+            sm_scale=self.scale,
             attn_sink=self.attn_sink,
-            extra_k_cache=kv_cache if not swa_only else None,
-            extra_indices_in_kvcache=topk_indices,
-            extra_topk_length=topk_lens,
+            extra_topk=extra_topk,
+            page_size_extra=page_size_extra,
+        )
+        self._sparse_mla_wrapper.run(
+            q=q,
+            kv_cache=swa_cache,
+            sparse_indices=swa_indices,
+            sparse_topk_lens=swa_lens,
+            extra_kv_cache=kv_cache if not swa_only else None,
+            extra_indices=topk_indices,
+            extra_topk_lens=topk_lens,
             out=output.unsqueeze(1),
         )
+        # ``tile_metadata`` is unused on the sm120 sparse-MLA path
+        # (sparse_mla_decode_v2_fwd computes its own scheduler metadata
+        # per call); the assertion above guarantees we always go through
+        # the wrapper, so the silent unused-var is intentional.
+        del tile_metadata
 
     def _forward_prefill(
         self,
@@ -973,11 +1017,33 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if flash_mla_sparse_fwd_supports_fp8_kv:
             assert swa_metadata.prefill_swa_indices is not None
             assert swa_metadata.prefill_swa_lens is not None
+            assert self._sparse_mla_wrapper is not None
             # unsqueeze(-2) adds the h_kv=1 axis without copying.
             swa_kv_paged = swa_k_cache.unsqueeze(-2)
             extra_kv_paged = (
                 compressed_k_cache.unsqueeze(-2)
                 if not swa_only else None
+            )
+            # Plan once outside the chunk loop — topk / extra_topk / page
+            # sizes are constant across chunks within this forward call.
+            extra_topk_pf = (
+                topk_indices.shape[-1] if not swa_only else 0
+            )
+            page_size_extra_pf = (
+                attn_metadata.block_size // self.compress_ratio
+                if (not swa_only and attn_metadata is not None)
+                else None
+            )
+            self._sparse_mla_wrapper.plan(
+                num_heads=q.size(-2),
+                head_dim_qk=q.size(-1),
+                head_dim_v=512,
+                page_size=swa_kv_paged.size(-3),
+                topk=swa_metadata.prefill_swa_indices.size(-1),
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_topk=extra_topk_pf,
+                page_size_extra=page_size_extra_pf,
             )
             for chunk_idx in range(num_chunks):
                 chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
@@ -996,15 +1062,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     if not swa_only else None
                 )
 
-                flash_mla_sparse_fwd(
+                self._sparse_mla_wrapper.run(
                     q=q[query_start:query_end],
-                    kv=swa_kv_paged,
-                    indices=swa_metadata.prefill_swa_indices[query_start:query_end],
-                    sm_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_length=swa_metadata.prefill_swa_lens[query_start:query_end],
-                    extra_k_cache=extra_kv_paged,
-                    extra_indices_in_kvcache=extra_indices_chunk,
+                    kv_cache=swa_kv_paged,
+                    sparse_indices=swa_metadata.prefill_swa_indices[
+                        query_start:query_end
+                    ],
+                    sparse_topk_lens=swa_metadata.prefill_swa_lens[
+                        query_start:query_end
+                    ],
+                    extra_kv_cache=extra_kv_paged,
+                    extra_indices=extra_indices_chunk,
                     out=output[query_start:query_end],
                 )
             return

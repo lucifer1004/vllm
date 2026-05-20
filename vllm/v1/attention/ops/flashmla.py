@@ -101,6 +101,7 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
 
 if _flashmla_sm120_AVAILABLE:
     from flash_mla_sm120 import (  # noqa: F401
+        BatchSparseMLAPagedAttentionWrapper,
         FlashMLASchedMeta,
         flash_mla_sparse_fwd,
         flash_mla_with_kvcache,
@@ -120,10 +121,25 @@ elif _is_flashmla_available()[0]:
         flash_mla_with_kvcache,
         get_mla_metadata,
     )
+
+    # The vendored FlashMLA backend does not currently ship a plan/run
+    # wrapper; DSv4 callers only construct one when on sm120, so this
+    # stub just exists so ``from ... import BatchSparseMLAPagedAttentionWrapper``
+    # is well-defined in the non-sm120 branch.
+    class BatchSparseMLAPagedAttentionWrapper:  # type: ignore[no-redef]
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise RuntimeError(
+                "BatchSparseMLAPagedAttentionWrapper requires flash_mla_sm120 "
+                "(sm120 sparse-MLA backend); not available on this device."
+            )
 else:
 
     class FlashMLASchedMeta:  # type: ignore[no-redef]
         pass
+
+    class BatchSparseMLAPagedAttentionWrapper:  # type: ignore[no-redef]
+        def __init__(self, *_args, **_kwargs) -> None:
+            _raise_flashmla_unavailable()
 
     flash_attn_varlen_func = _raise_flashmla_unavailable  # type: ignore[assignment]
     flash_attn_varlen_kvpacked_func = _raise_flashmla_unavailable  # type: ignore[assignment]
