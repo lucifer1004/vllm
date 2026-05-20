@@ -73,6 +73,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
+    flash_mla_sparse_fwd_supports_fp8_kv,
     flash_mla_with_kvcache,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -151,9 +152,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.head_dim = head_dim
         self.scale = scale
 
-        # FlashMLA sparse kernel only supports 64 or 128 heads; pad up to the
-        # next supported size. Must match DeepseekV4MLAAttention.padded_heads.
-        if num_heads <= 64:
+        # Must match DeepseekV4MLAAttention.padded_heads.
+        if num_heads <= 16:
+            self.padded_heads = 16
+        elif num_heads <= 32:
+            self.padded_heads = 32
+        elif num_heads <= 64:
             self.padded_heads = 64
         elif num_heads <= 128:
             self.padded_heads = 128
@@ -616,8 +620,7 @@ direct_register_custom_op(
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
-    # FlashMLA FP8 sparse only supports 64 or 128 heads
-    SUPPORTED_HEAD_COUNTS = (64, 128)
+    SUPPORTED_HEAD_COUNTS = (16, 32, 64, 128)
 
     def __init__(
         self,
@@ -662,16 +665,19 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        # Determine padded head count for FlashMLA
         if num_heads not in self.SUPPORTED_HEAD_COUNTS:
-            if num_heads < 64:
+            if num_heads <= 16:
+                self.padded_heads = 16
+            elif num_heads <= 32:
+                self.padded_heads = 32
+            elif num_heads < 64:
                 self.padded_heads = 64
             elif num_heads < 128:
                 self.padded_heads = 128
             else:
                 raise ValueError(
                     f"DeepseekV4MLAAttention does not support {num_heads} heads. "
-                    f"Supported: <= 128 (will be padded to 64 or 128)"
+                    f"Supported: <= 128 (will be padded to 16, 32, 64, or 128)"
                 )
         else:
             self.padded_heads = num_heads
@@ -915,7 +921,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
-        swa_only = attn_metadata is None
+        # `_dummy_run` passes synthetic non-None attn_metadata for swa-only
+        # layers during cudagraph capture, so check compress_ratio directly.
+        swa_only = self.compress_ratio <= 1
 
         num_prefills = swa_metadata.num_prefills
         num_prefill_tokens = swa_metadata.num_prefill_tokens
@@ -958,6 +966,48 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         M = N + self.window_size + self.max_num_batched_tokens
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+
+        # FP8 paged-direct prefill (sm120). The bf16 dequant+gather fallback
+        # below is incompatible with flash_mla_sm120 (requires paged FP8), so
+        # sm120 must take this branch for all layer types.
+        if flash_mla_sparse_fwd_supports_fp8_kv:
+            assert swa_metadata.prefill_swa_indices is not None
+            assert swa_metadata.prefill_swa_lens is not None
+            # unsqueeze(-2) adds the h_kv=1 axis without copying.
+            swa_kv_paged = swa_k_cache.unsqueeze(-2)
+            extra_kv_paged = (
+                compressed_k_cache.unsqueeze(-2)
+                if not swa_only else None
+            )
+            for chunk_idx in range(num_chunks):
+                chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
+                chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+                query_start = (
+                    query_start_loc_cpu[num_decodes + chunk_start]
+                    - prefill_token_base
+                )
+                query_end = (
+                    query_start_loc_cpu[num_decodes + chunk_end]
+                    - prefill_token_base
+                )
+
+                extra_indices_chunk = (
+                    topk_indices[query_start:query_end]
+                    if not swa_only else None
+                )
+
+                flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=swa_kv_paged,
+                    indices=swa_metadata.prefill_swa_indices[query_start:query_end],
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=swa_metadata.prefill_swa_lens[query_start:query_end],
+                    extra_k_cache=extra_kv_paged,
+                    extra_indices_in_kvcache=extra_indices_chunk,
+                    out=output[query_start:query_end],
+                )
+            return
 
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
