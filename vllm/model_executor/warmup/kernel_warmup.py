@@ -13,6 +13,9 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
+    deepseek_v4_mhc_warmup,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -197,7 +200,18 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
 
 
 def kernel_warmup(worker: "Worker"):
-    # Run first so input-prep kernels JIT against pristine runner state.
+    # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
+    # layer per token; warm them across token sizes first so the first real
+    # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+    deepseek_v4_mhc_warmup(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=(
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+        ),
+    )
+
+    # Run next so input-prep kernels JIT against pristine runner state.
     _deepseek_v4_sparse_mla_attention_warmup(worker)
     _deepseek_v4_request_prep_warmup(worker)
 
