@@ -23,7 +23,7 @@ def expert_num_tokens_round_up_and_sum(
     return torch.sum(ent).item()
 
 
-def compute_aligned_M(
+def compute_aligned_M_and_alignment(
     M: int,
     num_topk: int,
     local_num_experts: int,
@@ -37,6 +37,10 @@ def compute_aligned_M(
     expected_m. Callers that index by block size (e.g. ``M_sum // block_m``)
     or assert workspace alignment must use the returned `alignment_used`,
     not their original `alignment` argument.
+
+    Prefer this over the int-returning :func:`compute_aligned_M` when the
+    GEMM call site needs to wrap itself in ``mk_alignment_scope`` or
+    otherwise reason about the actual per-expert padding.
     """
     if (expert_tokens_meta is not None) and (
         expert_tokens_meta.expert_num_tokens_cpu is not None
@@ -74,6 +78,27 @@ def compute_aligned_M(
     M_sum = (M * num_topk) + max_active_experts * (alignment - 1)
     M_sum = round_up(M_sum, alignment)
     return M_sum, alignment
+
+
+def compute_aligned_M(
+    M: int,
+    num_topk: int,
+    local_num_experts: int,
+    alignment: int,
+    expert_tokens_meta: mk.ExpertTokensMetadata | None,
+) -> int:
+    """Return ``M_sum`` only (backward-compat wrapper).
+
+    Equivalent to :func:`compute_aligned_M_and_alignment`'s first return
+    value. Existing downstream callers and the warmup path that only size
+    a workspace use this. Call sites that need the actual per-expert
+    alignment (to wrap GEMMs in ``mk_alignment_scope``) should use
+    :func:`compute_aligned_M_and_alignment` instead.
+    """
+    M_sum, _ = compute_aligned_M_and_alignment(
+        M, num_topk, local_num_experts, alignment, expert_tokens_meta
+    )
+    return M_sum
 
 
 @triton.jit
@@ -391,7 +416,7 @@ def deepgemm_moe_permute(
 
     block_m, block_k = get_mk_alignment_for_contiguous_layout()
 
-    M_sum, align_used = compute_aligned_M(
+    M_sum, align_used = compute_aligned_M_and_alignment(
         M=topk_ids.size(0),
         num_topk=topk_ids.size(1),
         local_num_experts=local_num_experts,

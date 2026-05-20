@@ -320,11 +320,12 @@ def set_mk_alignment_for_contiguous_layout(value: int) -> None:
     """Set DeepGEMM's BLOCK_M cap for grouped contiguous GEMMs.
 
     The DG heuristic constrains BLOCK_M ≤ this value when picking a kernel
-    layout. Use this in concert with `compute_aligned_M`'s per-call alignment
-    so the workspace's per-expert padding matches the kernel's BLOCK_M; a
-    mismatch leads to the scheduler reading the wrong expert_id from
-    `m_indices` at `m_block_idx * BLOCK_M` stride and OOB-indexing the
-    B-weights tensor (manifests as IMA under CUDA-graph replay).
+    layout. Use this in concert with `compute_aligned_M_and_alignment`'s
+    per-call alignment so the workspace's per-expert padding matches the
+    kernel's BLOCK_M; a mismatch leads to the scheduler reading the wrong
+    expert_id from `m_indices` at `m_block_idx * BLOCK_M` stride and
+    OOB-indexing the B-weights tensor (manifests as IMA under CUDA-graph
+    replay).
     """
     _lazy_init()
     dg = _import_deep_gemm()
@@ -339,7 +340,7 @@ def mk_alignment_scope(value: int):
 
     Use around a sequence of grouped-contiguous GEMM calls whose workspace
     is padded to `value` (typically the per_call_align returned by
-    `compute_aligned_M`).
+    `compute_aligned_M_and_alignment`).
     """
     prev = _get_mk_alignment_for_contiguous_layout_impl()
     set_mk_alignment_for_contiguous_layout(value)

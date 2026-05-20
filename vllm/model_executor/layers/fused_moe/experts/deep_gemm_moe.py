@@ -12,7 +12,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
-    compute_aligned_M,
+    compute_aligned_M_and_alignment,
     deepgemm_moe_permute,
     deepgemm_unpermute_and_reduce,
 )
@@ -184,7 +184,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         assert self.block_shape is not None
         block_m = self.block_shape[0]
-        M_sum, align_used = compute_aligned_M(
+        M_sum, align_used = compute_aligned_M_and_alignment(
             M, topk, local_num_experts, block_m, expert_tokens_meta
         )
         assert M_sum % align_used == 0
@@ -277,7 +277,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
         assert w2.size(1) == K
 
-        M_sum, _ = compute_aligned_M(
+        M_sum, _ = compute_aligned_M_and_alignment(
             M=topk_ids.size(0),
             num_topk=topk_ids.size(1),
             local_num_experts=local_num_experts,
@@ -411,7 +411,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         block_m = get_mk_alignment_for_contiguous_layout()[0]
-        M_sum, align_used = compute_aligned_M(
+        M_sum, align_used = compute_aligned_M_and_alignment(
             M, topk, local_num_experts, block_m, expert_tokens_meta
         )
         assert M_sum % align_used == 0
@@ -490,7 +490,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        M_sum, _ = compute_aligned_M(
+        M_sum, _ = compute_aligned_M_and_alignment(
             M=topk_ids.size(0),
             num_topk=topk_ids.size(1),
             local_num_experts=local_num_experts,
