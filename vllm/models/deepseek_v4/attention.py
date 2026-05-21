@@ -1006,27 +1006,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 compressed_k_cache.unsqueeze(-2)
                 if not swa_only else None
             )
-            # Plan once outside the chunk loop — topk / extra_topk / page
-            # sizes are constant across chunks within this forward call.
-            extra_topk_pf = (
-                topk_indices.shape[-1] if not swa_only else 0
-            )
-            page_size_extra_pf = (
-                attn_metadata.block_size // self.compress_ratio
-                if (not swa_only and attn_metadata is not None)
-                else None
-            )
-            self._sparse_mla_wrapper.plan(
-                num_heads=q.size(-2),
-                head_dim_qk=q.size(-1),
-                head_dim_v=512,
-                page_size=swa_kv_paged.size(-3),
-                topk=swa_metadata.prefill_swa_indices.size(-1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                extra_topk=extra_topk_pf,
-                page_size_extra=page_size_extra_pf,
-            )
+            # flashinfer wrapper has no plan() step — per-step params (sm_scale,
+            # attn_sink, indices, topk lengths, optional extra cache) are
+            # passed directly to run().
             for chunk_idx in range(num_chunks):
                 chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
                 chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
@@ -1047,15 +1029,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 self._sparse_mla_wrapper.run(
                     q=q[query_start:query_end],
                     kv_cache=swa_kv_paged,
-                    sparse_indices=swa_metadata.prefill_swa_indices[
+                    indices=swa_metadata.prefill_swa_indices[
                         query_start:query_end
                     ],
-                    sparse_topk_lens=swa_metadata.prefill_swa_lens[
+                    output=output[query_start:query_end],
+                    sm_scale=self.scale,
+                    topk_length=swa_metadata.prefill_swa_lens[
                         query_start:query_end
                     ],
+                    attn_sink=self.attn_sink,
                     extra_kv_cache=extra_kv_paged,
                     extra_indices=extra_indices_chunk,
-                    out=output[query_start:query_end],
                 )
             return
 
