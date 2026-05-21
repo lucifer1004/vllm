@@ -690,27 +690,28 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         assert swa_cache_layer is not None
         self.swa_cache_layer: DeepseekV4SWACache = swa_cache_layer
 
-        # Plan/run wrapper for sm120 sparse-MLA. Construction is cheap
-        # (no GPU work); plan() is called per step inside the forward
-        # path with the actual per-step topk shapes. When this kernel
-        # family migrates upstream to FlashInfer, the import target
-        # changes (`flashinfer.BatchSparseMLAPagedAttentionWrapper`) but
-        # this construction and the run-site call stay the same.
-        # On non-sm120 platforms the stub wrapper raises at __init__,
-        # so we only construct it when the sm120 sparse fast path is
-        # active.
-        self._sparse_mla_wrapper: BatchSparseMLAPagedAttentionWrapper | None
-        if flash_mla_sparse_fwd_supports_fp8_kv:
-            self._sparse_mla_wrapper = BatchSparseMLAPagedAttentionWrapper()
-        else:
-            self._sparse_mla_wrapper = None
-
-        # Get vllm config for cache setup
+        # Get vllm config (used for both the wrapper sizing and cache setup).
         vllm_config = get_current_vllm_config()
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+
+        # flashinfer.BatchSparseMLAPagedAttentionWrapper — pre-allocates
+        # the workspace + LSE buffer at construction; cudagraph-friendly.
+        # No plan() step; per-step params (sm_scale, attn_sink, page sizes)
+        # are passed directly to run(). On non-sm120 platforms the stub
+        # wrapper in flashmla.py raises at __init__, so we only construct
+        # it when the sm120 sparse fast path is active.
+        self._sparse_mla_wrapper: BatchSparseMLAPagedAttentionWrapper | None
+        if flash_mla_sparse_fwd_supports_fp8_kv:
+            self._sparse_mla_wrapper = BatchSparseMLAPagedAttentionWrapper(
+                max_num_tokens=self.max_num_batched_tokens,
+                max_num_heads=self.padded_heads,
+                d_v=512,
+            )
+        else:
+            self._sparse_mla_wrapper = None
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
@@ -909,45 +910,26 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             "allocate one for this layer type."
         )
 
-        # Plan/run via the wrapper (`BatchSparseMLAPagedAttentionWrapper`)
-        # — the FlashInfer-style canonical interface. plan() captures the
-        # per-step layer config (cheap: no GPU work); run() dispatches
-        # through ``sparse_mla_fwd`` to either ``sparse_mla_decode_v2_fwd``
-        # (num_tokens ≤ 64) or ``sparse_mla_prefill_fwd`` (larger).
+        # Run via the wrapper (`flashinfer.BatchSparseMLAPagedAttentionWrapper`).
+        # No plan() step in the flashinfer API — per-step params (sm_scale,
+        # attn_sink, indices/topk_length, optional extra cache for compressed
+        # layers) are passed directly to run(). The wrapper auto-dispatches
+        # decode-v2 (num_tokens <= 64) vs prefill on num_tokens.
         assert self._sparse_mla_wrapper is not None, (
             "DeepseekV4 attention requires the sm120 sparse-MLA backend; "
             "_sparse_mla_wrapper should have been constructed in __init__."
         )
-        extra_topk = (
-            topk_indices.shape[-1] if topk_indices is not None else 0
-        )
-        # When the extra cache is engaged, its page block size is
-        # main_block_size / compress_ratio (DSv4 compressed-cache layout).
-        page_size_extra = (
-            attn_metadata.block_size // self.compress_ratio
-            if (not swa_only and attn_metadata is not None)
-            else None
-        )
-        self._sparse_mla_wrapper.plan(
-            num_heads=q.size(-2),
-            head_dim_qk=q.size(-1),
-            head_dim_v=512,
-            page_size=swa_cache.size(-3),
-            topk=swa_indices.size(-1),
-            sm_scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_topk=extra_topk,
-            page_size_extra=page_size_extra,
-        )
         self._sparse_mla_wrapper.run(
             q=q,
             kv_cache=swa_cache,
-            sparse_indices=swa_indices,
-            sparse_topk_lens=swa_lens,
+            indices=swa_indices,
+            output=output,
+            sm_scale=self.scale,
+            topk_length=swa_lens,
+            attn_sink=self.attn_sink,
             extra_kv_cache=kv_cache if not swa_only else None,
             extra_indices=topk_indices,
-            extra_topk_lens=topk_lens,
-            out=output.unsqueeze(1),
+            extra_topk_length=topk_lens,
         )
         # ``tile_metadata`` is unused on the sm120 sparse-MLA path
         # (sparse_mla_decode_v2_fwd computes its own scheduler metadata

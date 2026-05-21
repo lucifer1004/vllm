@@ -100,12 +100,18 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
 
 
 if _flashmla_sm120_AVAILABLE:
+    # BatchSparseMLAPagedAttentionWrapper migrated to flashinfer (PR #3374).
+    # Other sm120 primitives stay on flash_mla_sm120 — they have no
+    # flashinfer equivalent today (FlashMLASchedMeta, get_mla_metadata,
+    # flash_mla_sparse_fwd, flash_mla_with_kvcache).
     from flash_mla_sm120 import (  # noqa: F401
-        BatchSparseMLAPagedAttentionWrapper,
         FlashMLASchedMeta,
         flash_mla_sparse_fwd,
         flash_mla_with_kvcache,
         get_mla_metadata,
+    )
+    from flashinfer import (  # noqa: F401
+        BatchSparseMLAPagedAttentionWrapper,
     )
 
     flash_attn_varlen_func = _raise_flashmla_unavailable  # type: ignore[assignment]
