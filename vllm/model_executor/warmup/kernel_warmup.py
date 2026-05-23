@@ -144,6 +144,87 @@ def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
     torch.accelerator.synchronize()
 
 
+def _deepseek_v4_sparse_mla_decode_autotune(
+    worker: "Worker",
+    num_tokens: int,
+) -> bool:
+    """Autotune FlashInfer's DSv4 SM120 sparse-MLA decode path.
+
+    Returns True when this function consumed the mixed attention warmup shape.
+    """
+    if worker.vllm_config.kernel_config.enable_flashinfer_autotune is not True:
+        return False
+    if not has_flashinfer() or not current_platform.is_device_capability_family(120):
+        return False
+
+    try:
+        from flashinfer import sparse_mla_sm120_decode_dsv4_autotune
+        from flashinfer.autotuner import AutoTuner
+    except ImportError:
+        logger.warning(
+            "Skipping DeepSeek V4 sparse MLA decode autotune because this "
+            "FlashInfer build does not expose sparse_mla_sm120_decode_dsv4_autotune."
+        )
+        return False
+
+    from vllm.distributed.parallel_state import get_world_group
+
+    runner = worker.model_runner
+    world = get_world_group()
+    is_leader = world.rank_in_group == 0
+    cache_path = _resolve_flashinfer_autotune_file(runner)
+
+    dummy_run_kwargs = dict(
+        num_tokens=num_tokens,
+        skip_eplb=True,
+        is_profile=True,
+        force_attention=True,
+        create_mixed_batch=True,
+    )
+
+    if is_leader:
+        logger.info(
+            "Autotuning DeepSeek V4 SM120 sparse MLA decode with FlashInfer "
+            "cache file: %s",
+            cache_path,
+        )
+
+    with torch.inference_mode():
+        if is_leader:
+            with sparse_mla_sm120_decode_dsv4_autotune(cache_path=str(cache_path)):
+                runner._dummy_run(**dummy_run_kwargs)
+        else:
+            runner._dummy_run(**dummy_run_kwargs)
+
+    tune_results: bytes | None = None
+    if is_leader and cache_path.exists():
+        with open(cache_path, "rb") as f:
+            tune_results = f.read()
+
+    tune_results = world.broadcast_object(tune_results, src=0)
+    if tune_results is None:
+        logger.warning(
+            "No DeepSeek V4 sparse MLA decode autotune cache entries found. "
+            "Falling back to FlashInfer's default tactic heuristic."
+        )
+        world.barrier()
+        return True
+
+    if not is_leader and world.local_rank == 0:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            f.write(tune_results)
+    world.barrier()
+
+    AutoTuner.get().load_configs(str(cache_path))
+    logger.info(
+        "DeepSeek V4 sparse MLA decode autotune cache loaded on rank %d from %s.",
+        world.rank_in_group,
+        cache_path,
+    )
+    return True
+
+
 def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     """Warm sparse-MLA attention shapes via `_dummy_run`.
 
@@ -175,13 +256,17 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
         prefill_tokens,
     )
     if mixed_tokens > 0:
-        runner._dummy_run(
-            num_tokens=mixed_tokens,
-            skip_eplb=True,
-            is_profile=True,
-            force_attention=True,
-            create_mixed_batch=True,
+        mixed_warmup_done = _deepseek_v4_sparse_mla_decode_autotune(
+            worker, mixed_tokens
         )
+        if not mixed_warmup_done:
+            runner._dummy_run(
+                num_tokens=mixed_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                force_attention=True,
+                create_mixed_batch=True,
+            )
     if prefill_tokens > 0:
         runner._dummy_run(
             num_tokens=prefill_tokens,
