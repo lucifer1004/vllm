@@ -29,9 +29,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
 
 if TYPE_CHECKING:
-    from vllm.models.deepseek_v4.nvidia.flashmla import (
-        DeepseekV4SparseMLAAttentionImpl,
-    )
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
     )
@@ -74,9 +71,45 @@ from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd_supports_fp8_kv,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
-from vllm.v1.worker.workspace import current_workspace_manager
+
+if TYPE_CHECKING:
+    from vllm.models.deepseek_v4.nvidia.flashmla import (
+        DeepseekV4SparseMLAAttentionImpl,
+    )
 
 logger = init_logger(__name__)
+
+
+def _supported_padded_heads(num_heads: int) -> int:
+    """Round ``num_heads`` up to the next padded count supported by the
+    platform's sparse-MLA kernel.
+
+    The flashinfer SM120 ``BatchSparseMLAPagedAttentionWrapper`` accepts
+    ``num_heads ∈ {8, 16, 32, 64, 128}`` natively — small-TP shards on
+    DSv4-Flash (e.g. TP=8 → 16 heads/rank) stay at their native count.
+    Hopper FlashMLA + ROCm aiter sparse only support 64 / 128, so on
+    those paths smaller shards still pad up to 64.
+
+    Must be called consistently by the layer, the outer attention wrapper,
+    and the model-side ``attn_sink`` allocation, otherwise the kernel
+    sees mismatched ``num_heads`` between ``q`` (padded) and ``attn_sink``
+    (un-padded).
+    """
+    cap = current_platform.get_device_capability()
+    sm120 = cap is not None and cap.major == 12
+    if sm120:
+        if num_heads <= 16:
+            return 16
+        if num_heads <= 32:
+            return 32
+    if num_heads <= 64:
+        return 64
+    if num_heads <= 128:
+        return 128
+    raise ValueError(
+        f"DeepseekV4 attention does not support {num_heads} heads "
+        "(must be <= 128)."
+    )
 
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
@@ -169,20 +202,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.head_dim = head_dim
         self.scale = scale
 
-        # Must match DeepseekV4MLAAttention.padded_heads.
-        if num_heads <= 16:
-            self.padded_heads = 16
-        elif num_heads <= 32:
-            self.padded_heads = 32
-        elif num_heads <= 64:
-            self.padded_heads = 64
-        elif num_heads <= 128:
-            self.padded_heads = 128
-        else:
-            raise ValueError(
-                f"DeepseekV4 attention does not support {num_heads} heads "
-                "(must be <= 128)."
-            )
+        # Must match DeepseekV4MLAAttention.padded_heads and the model-side
+        # ``attn_sink`` allocation. SM120 supports a finer matrix; other
+        # arch pads up to 64/128.
+        self.padded_heads = _supported_padded_heads(num_heads)
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -458,33 +481,38 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
-            aux_stream = (
-                self.aux_stream_list[0] if self.aux_stream_list is not None else None
-            )
+            aux_streams = self.aux_stream_list
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
             compressor = self.compressor
 
-            def wq_b_kv_insert_and_compress() -> torch.Tensor:
+            def wq_b_kv_insert() -> torch.Tensor:
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                compressor(kv_score, positions, self.rotary_emb)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert_and_compress,
-                lambda: indexer(
-                    hidden_states,
-                    qr,
-                    indexer_kv_score,
-                    indexer_weights,
-                    positions,
-                    self.indexer_rotary_emb,
-                ),
+            # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs
+            # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
+            # MLA compressor. Slot [2] is reserved for the indexer's inner
+            # overlap. ROCm (aux_streams is None) falls back to sequential.
+            q, _ = execute_in_parallel(
+                wq_b_kv_insert,
+                [
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                ],
                 self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
+                [self.ln_events[1], self.ln_events[2]],
+                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
+                enable=aux_streams is not None,
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
@@ -509,25 +537,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             # SWA-only layer: no compressor, no overlap.
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-
-        # Handle dummy run (no metadata).
-        if not isinstance(attn_metadata, dict):
-            # Reserve _forward_prefill's bf16-gather workspace; the dummy
-            # run returns before mla_attn runs, so without this the shared
-            # workspace locks below the real prefill size.
-            sub = self.mla_attn
-            swa_only = sub.compress_ratio <= 1
-            N = (
-                0
-                if swa_only
-                else (sub.max_model_len + sub.compress_ratio - 1) // sub.compress_ratio
-            )
-            M = N + sub.window_size + sub.max_num_batched_tokens
-            current_workspace_manager().get_simultaneous(
-                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )
-            out.zero_()
-            return
 
         # Pad q to FlashMLA-required head count (64 or 128)
         if self.n_local_heads < self.padded_heads:
@@ -637,7 +646,6 @@ direct_register_custom_op(
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
-    SUPPORTED_HEAD_COUNTS = (16, 32, 64, 128)
 
     def __init__(
         self,
@@ -684,22 +692,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        if num_heads not in self.SUPPORTED_HEAD_COUNTS:
-            if num_heads <= 16:
-                self.padded_heads = 16
-            elif num_heads <= 32:
-                self.padded_heads = 32
-            elif num_heads < 64:
-                self.padded_heads = 64
-            elif num_heads < 128:
-                self.padded_heads = 128
-            else:
-                raise ValueError(
-                    f"DeepseekV4MLAAttention does not support {num_heads} heads. "
-                    f"Supported: <= 128 (will be padded to 16, 32, 64, or 128)"
-                )
-        else:
-            self.padded_heads = num_heads
+        # Must match DeepseekV4MultiHeadLatentAttentionWrapper.padded_heads
+        # and the model-side attn_sink size; gated on capability so Hopper /
+        # SM10 / ROCm don't accidentally drive their FlashMLA / aiter
+        # kernels with an unsupported small head count.
+        self.padded_heads = _supported_padded_heads(num_heads)
 
         # Store attention sink
         assert attn_sink is not None
@@ -708,19 +705,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         assert swa_cache_layer is not None
         self.swa_cache_layer: DeepseekV4SWACache = swa_cache_layer
 
-        # Get vllm config (used for both the wrapper sizing and cache setup).
+        # Get vllm config for cache setup
         vllm_config = get_current_vllm_config()
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        # flashinfer.BatchSparseMLAPagedAttentionWrapper — pre-allocates
-        # the workspace + LSE buffer at construction; cudagraph-friendly.
-        # No plan() step; per-step params (sm_scale, attn_sink, page sizes)
-        # are passed directly to run(). On non-sm120 platforms the stub
-        # wrapper in flashmla.py raises at __init__, so we only construct
-        # it when the sm120 sparse fast path is active.
+        # SM120 sparse-MLA fast path: pre-allocate the flashinfer
+        # ``BatchSparseMLAPagedAttentionWrapper`` (workspace + LSE buffer)
+        # once per layer so DeepseekV4SM120SparseImpl can dispatch through
+        # it without per-step setup. On non-SM120 platforms the wrapper
+        # stub raises at __init__, so gate on the capability flag.
         self._sparse_mla_wrapper: BatchSparseMLAPagedAttentionWrapper | None
         if flash_mla_sparse_fwd_supports_fp8_kv:
             self._sparse_mla_wrapper = BatchSparseMLAPagedAttentionWrapper(
@@ -730,6 +726,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             self._sparse_mla_wrapper = None
+
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
@@ -845,6 +842,7 @@ class DeepseekV4Indexer(nn.Module):
         topk_indices_buffer: torch.Tensor | None,
         compress_ratio: int = 1,
         prefix: str = "",
+        aux_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -930,6 +928,13 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4_cache=self.use_fp4_kv,
         )
 
+        # None on ROCm — maybe_execute_in_parallel falls back to sequential.
+        self.aux_stream = aux_stream
+        self.ln_events: list[torch.cuda.Event] = [
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+        ]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -939,17 +944,29 @@ class DeepseekV4Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
-        # ReplicatedLinear returns (output, bias); bias is None.
-        q, _ = self.wq_b(qr)
-        q = q.view(-1, self.n_head, self.head_dim)
-        k = self.compressor(compressed_kv_score, positions, rotary_emb)
-        q_quant, weights = fused_indexer_q_rope_quant(
-            positions,
-            q,
-            rotary_emb.cos_sin_cache,
-            indexer_weights,
-            self.softmax_scale,
-            self.n_head**-0.5,
-            use_fp4=self.use_fp4_kv,
+        compressor = self.compressor
+
+        def wq_b_and_q_quant():
+            # ReplicatedLinear returns (output, bias); bias is None.
+            q, _ = self.wq_b(qr)
+            q = q.view(-1, self.n_head, self.head_dim)
+            return fused_indexer_q_rope_quant(
+                positions,
+                q,
+                rotary_emb.cos_sin_cache,
+                indexer_weights,
+                self.softmax_scale,
+                self.n_head**-0.5,
+                use_fp4=self.use_fp4_kv,
+            )
+
+        # compressor returns None and writes K to the indexer KV cache; the
+        # join orders that write before indexer_op (skip_k_cache_insert=True).
+        (q_quant, weights), k = maybe_execute_in_parallel(
+            wq_b_and_q_quant,
+            lambda: compressor(compressed_kv_score, positions, rotary_emb),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)

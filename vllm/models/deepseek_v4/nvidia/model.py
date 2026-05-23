@@ -862,15 +862,13 @@ class DeepseekV4Attention(nn.Module):
 
         # Padded to next FlashMLA-supported head count ({16, 32, 64, 128}),
         # initialized to -inf so padded slots contribute no sink effect.
-        # Must match DeepseekV4MLAAttention.padded_heads.
-        if self.n_local_heads <= 16:
-            padded_heads = 16
-        elif self.n_local_heads <= 32:
-            padded_heads = 32
-        elif self.n_local_heads <= 64:
-            padded_heads = 64
-        else:
-            padded_heads = 128
+        # Must match DeepseekV4MLAAttention.padded_heads (capability-gated:
+        # SM120 supports the finer 16/32/64/128 matrix; other arch use
+        # FlashMLA's 64/128).
+        from vllm.models.deepseek_v4.nvidia.ops.attention import (
+            _supported_padded_heads,
+        )
+        padded_heads = _supported_padded_heads(self.n_local_heads)
         self.attn_sink = nn.Parameter(
             torch.full((padded_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
