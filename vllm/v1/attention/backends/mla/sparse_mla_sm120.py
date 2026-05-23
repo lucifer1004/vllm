@@ -63,8 +63,11 @@ class SparseMLASm120Backend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # V32 v2 kernel dispatches PAGE_BLOCK_SIZE=64 only (matches the vLLM
-        # DeepseekV32IndexerBackend CUDA-platform default).
+        # Must equal DeepseekV32IndexerBackend.get_supported_kernel_block_sizes
+        # on CUDA (= [64]); vLLM's prepare_kernel_block_sizes requires a
+        # common block size across the indexer cache and the main sparse-MLA
+        # cache, so we cannot offer pbs=1 here. The flashinfer V32 v2 decode
+        # kernel dispatches PAGE_BLOCK_SIZE=64 natively.
         return [64]
 
     @staticmethod
