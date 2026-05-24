@@ -259,6 +259,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_DSV4_REPLICATE_SHARED_EXPERTS: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -1868,6 +1869,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # Experimental DeepSeek-V4 workaround: replicate shared experts instead
+    # of tensor-sharding them. This avoids block-FP8 row-parallel shard shapes
+    # that are not divisible by the weight quantization block size.
+    "VLLM_DSV4_REPLICATE_SHARED_EXPERTS": lambda: bool(
+        int(os.getenv("VLLM_DSV4_REPLICATE_SHARED_EXPERTS", "0"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream

@@ -8,6 +8,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -637,6 +638,10 @@ class DeepseekV4MoE(nn.Module):
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size
+        self.replicate_shared_experts = (
+            getattr(config, "replicate_shared_experts", False)
+            or envs.VLLM_DSV4_REPLICATE_SHARED_EXPERTS
+        )
 
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.num_experts_per_tok
@@ -698,6 +703,7 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
                 reduce_results=self.use_mega_moe,
+                is_sequence_parallel=self.replicate_shared_experts,
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -746,7 +752,9 @@ class DeepseekV4MoE(nn.Module):
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         # We don't pass `gate` into FusedMoE
         self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
+            shared_experts=(
+                None if self.replicate_shared_experts else self.shared_experts
+            ),
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -809,11 +817,18 @@ class DeepseekV4MoE(nn.Module):
         assert not self.experts.is_internal_router
         org_shape = hidden_states.shape
         normed_x, router_logits = self.norm_gate(hidden_states)
+        shared_output = (
+            self.shared_experts(normed_x)
+            if self.replicate_shared_experts and self.shared_experts is not None
+            else None
+        )
         final_hidden_states = self.experts(
             hidden_states=normed_x,
             router_logits=router_logits,
             input_ids=input_ids,
         )
+        if shared_output is not None:
+            final_hidden_states += shared_output
 
         return final_hidden_states.view(org_shape)
 
