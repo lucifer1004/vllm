@@ -23,6 +23,7 @@ from vllm import _custom_ops as ops
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 
 # TODO: Integrate ROCMAiterMLASparseBackend for ROCm.
 # The ROCm sparse MLA backend (rocm_aiter_mla_sparse.py) has a compatible
@@ -43,6 +44,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.mla.indexer import split_indexer_prefill_chunks
+from vllm.v1.attention.backends.mla.sparse_mla_sm120 import SparseMLASm120Backend
 from vllm.v1.attention.backends.utils import split_prefill_chunks
 from vllm.v1.attention.ops import flashmla
 
@@ -65,6 +67,43 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def _validate_sm120_sparse_backend(
+    kv_cache_dtype: str,
+    index_topk: int = 2048,
+) -> list[str]:
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-V3.2-Exp",
+        block_size=64,
+        hf_config_override={"index_topk": index_topk},
+    )
+    vllm_config.model_config.hf_text_config = SimpleNamespace(index_topk=index_topk)
+    with set_current_vllm_config(vllm_config):
+        return SparseMLASm120Backend.validate_configuration(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=kv_cache_dtype,
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bfloat16", "fp8"])
+def test_sparse_mla_sm120_rejects_non_packed_fp8(kv_cache_dtype: str):
+    reasons = _validate_sm120_sparse_backend(kv_cache_dtype)
+    assert "kv_cache_dtype not supported" in reasons
+
+
+def test_sparse_mla_sm120_rejects_non_v32_topk():
+    reasons = _validate_sm120_sparse_backend("fp8_ds_mla", index_topk=128)
+    assert "SPARSE_MLA_SM120 requires index_topk=2048; got 128" in reasons
 
 
 def _float_to_e8m0_truncate(f: float) -> float:
@@ -174,8 +213,8 @@ def _quantize_dequantize_fp8_ds_mla(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [FlashMLASparseBackend, FlashInferMLASparseBackend],
-    ids=["FlashMLA", "FlashInfer"],
+    [FlashMLASparseBackend, FlashInferMLASparseBackend, SparseMLASm120Backend],
+    ids=["FlashMLA", "FlashInfer", "SparseMLASm120"],
 )
 @pytest.mark.parametrize("batch_name", list(SPARSE_BACKEND_BATCH_SPECS.keys()))
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_ds_mla"])
@@ -217,9 +256,12 @@ def test_sparse_backend_decode_correctness(
         ok, reason = flashmla.is_flashmla_sparse_supported()
         if not ok:
             pytest.skip(reason)
-    elif backend_cls == FlashInferMLASparseBackend:
-        if not current_platform.has_device_capability(100):
-            pytest.skip("FlashInferMLASparseBackend requires SM 10.0 or higher")
+    else:
+        device_capability = current_platform.get_device_capability()
+        if device_capability is None or not backend_cls.supports_compute_capability(
+            device_capability
+        ):
+            pytest.skip(f"{backend_cls.get_name()} does not support this GPU")
 
     batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
@@ -237,7 +279,9 @@ def test_sparse_backend_decode_correctness(
     qk_rope_head_dim = 64
     v_head_dim = 128
     head_size = kv_lora_rank + qk_rope_head_dim
-    topk_tokens = 128
+    # V32 production configs and SM120 prefill dispatch use index_topk=2048.
+    # Keep the pre-existing FlashMLA/FlashInfer test shape unchanged.
+    topk_tokens = 2048 if backend_cls == SparseMLASm120Backend else 128
 
     max_seqlen = max(batch_spec.seq_lens)
     total_cache_tokens = sum(batch_spec.seq_lens)

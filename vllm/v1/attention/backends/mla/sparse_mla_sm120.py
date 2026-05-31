@@ -7,9 +7,10 @@ and ``FlashMLASparseBackend`` (Hopper). Targets the V32 (DSv3.2 family) sparse
 MLA backend routed through FlashInfer's MLA wrapper with
 ``backend="sparse-sm120"``.
 
-Same envelope as the FlashMLA path: ``fp8_ds_mla`` KV cache layout (656 B/token
-INLINE: 512 NoPE + 16 scales + 128 RoPE), head_size = 576, paged block_size =
-64. Works for V32-family models (DeepSeek V3.2, GLM-5.1, Kimi K2.5, ...).
+Same envelope as the FlashMLA V32 path: ``fp8_ds_mla`` KV cache layout
+(656 B/token INLINE: 512 NoPE + 16 scales + 128 RoPE), head_size = 576,
+paged block_size = 64. Works for V32-family DSA models with ``index_topk=2048``
+such as DeepSeek V3.2 and GLM-5.
 """
 
 from dataclasses import dataclass
@@ -75,16 +76,13 @@ def _get_decode_scratch(
 class SparseMLASm120Backend(AttentionBackend):
     """SM120 FlashInfer sparse-MLA backend.
 
-    V32-family (DSv3.2 / GLM-5.1 / Kimi K2.5) — fp8_ds_mla KV cache, 576
-    head_size, paged block_size = 64.
+    V32-family DSA models — fp8_ds_mla KV cache, 576 head_size,
+    index_topk=2048, paged block_size = 64.
     """
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto",
-        "bfloat16",
         "fp8_ds_mla",
-        "fp8",  # alias for fp8_ds_mla on this backend (auto-converted by MLAAttention)
     ]
 
     @staticmethod
@@ -137,16 +135,23 @@ class SparseMLASm120Backend(AttentionBackend):
         use_sparse: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        # Require an indexer-equipped model. The wrapper's dispatch table covers
-        # h ∈ {8,16,32,64,128} × topk ∈ {128,512,1024,2048}; both are the
-        # standard V32-family envelope, so we don't gate further here.
+        # Require an indexer-equipped V32 model. Decode has a broader synthetic
+        # topk instantiation set, but the V32 prefill dispatcher and published
+        # model configs use index_topk=2048, so that is the supported serving
+        # contract for this backend.
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
         if vllm_config.model_config is not None:
             hf_text_config = vllm_config.model_config.hf_text_config
-            if not hasattr(hf_text_config, "index_topk"):
+            index_topk = getattr(hf_text_config, "index_topk", None)
+            if index_topk is None:
                 return "SPARSE_MLA_SM120 requires a model with index_topk config"
+            if int(index_topk) != 2048:
+                return (
+                    "SPARSE_MLA_SM120 requires index_topk=2048; "
+                    f"got {index_topk}"
+                )
         return None
 
     @staticmethod
@@ -282,6 +287,11 @@ class SparseMLASm120Impl(SparseMLAAttentionImpl[SparseMLASm120Metadata]):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        if self.kv_cache_dtype != "fp8_ds_mla":
+            raise NotImplementedError(
+                "SPARSE_MLA_SM120 requires the packed fp8_ds_mla KV cache "
+                f"layout; got kv_cache_dtype={kv_cache_dtype!r}."
+            )
 
         # MLA dims (absorbed: Q post-projection is [T, H, kv_lora_rank + rope]).
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
@@ -318,8 +328,9 @@ class SparseMLASm120Impl(SparseMLAAttentionImpl[SparseMLASm120Metadata]):
             self.topk_indices_buffer.shape[-1],
         )
 
-        # Q is passed pre-quantized to fp8 only when the kernel asks for it;
-        # V32 v2 takes BF16 Q today and quantizes inside the kernel.
+        # fp8_ds_mla stores per-token dequant scales inline in KV. The
+        # sparse-sm120 wrapper exposes only sm_scale, so do not fold q/k/v cache
+        # scales into bmm1/bmm2 here. V32 v2 takes BF16 Q and quantizes inside.
         self.supports_quant_query_input = False
 
     def forward_mqa(
