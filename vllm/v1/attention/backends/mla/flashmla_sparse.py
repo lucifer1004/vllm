@@ -229,6 +229,10 @@ class FlashMLASparseMetadata(AttentionMetadata):
     c128a_decode_topk_lens: torch.Tensor | None = None
     # Prefill: local topk indices (used by combine_topk_swa_indices).
     c128a_prefill_topk_indices: torch.Tensor | None = None
+    # SM120 native-HCA path: dense compressed-prefix lengths only. FlashInfer
+    # maps these lengths to slot IDs at launch time.
+    c128a_decode_hca_lens: torch.Tensor | None = None
+    c128a_prefill_hca_lens: torch.Tensor | None = None
 
 
 def get_prefill_workspace_size(max_model_len: int):
@@ -346,7 +350,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                     device=self.device,
                 )
 
-            # Pre-allocate C128A topk buffers for CUDA graph address stability.
+            # Pre-allocate C128A metadata buffers for CUDA graph address
+            # stability. SM120 native-HCA only needs compressed-prefix lengths;
+            # other backends still materialize top-k index metadata.
             if self.compress_ratio == 128:
                 max_num_batched_tokens = (
                     vllm_config.scheduler_config.max_num_batched_tokens
@@ -371,21 +377,28 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 # writes into adjacent rows (present in both decode and prefill
                 # branches of _build_c128a_topk_metadata_kernel).
                 self.c128a_max_compressed = c128a_max_compressed
-                self.c128a_global_decode_buffer = torch.empty(
-                    (max_num_batched_tokens, c128a_max_compressed),
-                    dtype=torch.int32,
-                    device=self.device,
-                )
                 self.c128a_decode_lens_buffer = torch.empty(
                     max_num_batched_tokens,
                     dtype=torch.int32,
                     device=self.device,
                 )
-                self.c128a_prefill_buffer = torch.empty(
-                    (max_num_batched_tokens, c128a_max_compressed),
-                    dtype=torch.int32,
-                    device=self.device,
-                )
+                if current_platform.is_device_capability_family(120):
+                    self.c128a_prefill_lens_buffer = torch.empty(
+                        max_num_batched_tokens,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                else:
+                    self.c128a_global_decode_buffer = torch.empty(
+                        (max_num_batched_tokens, c128a_max_compressed),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.c128a_prefill_buffer = torch.empty(
+                        (max_num_batched_tokens, c128a_max_compressed),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
 
     def _build_fp8_mixed_decode_prefill(
         self,
@@ -613,7 +626,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             else:
                 fp8_extra_metadata = self._build_fp8_separate_prefill_decode(cm)
 
-        # Pre-compute C128A topk indices for DeepseekV4.
+        # Pre-compute C128A sparse metadata for DeepseekV4.
         c128a_fields = {}
         if self.is_deepseek_v4 and self.compress_ratio == 128:
             c128a_fields = self._build_c128a_metadata(cm, req_id_per_token)
@@ -641,7 +654,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         cm: CommonAttentionMetadata,
         req_id_per_token: torch.Tensor,
     ) -> dict[str, torch.Tensor | None]:
-        """Pre-compute C128A topk indices for DeepseekV4 (compress_ratio >= 128)."""
+        """Pre-compute C128A sparse metadata for DeepseekV4."""
         # Must match SWA's decode split (no `require_uniform=True`) so
         # `c128a_global_decode_topk_indices.shape[0]` lines up with q in
         # `_forward_decode`. The per-token C128A kernel handles non-uniform
@@ -660,6 +673,23 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         assert cm.positions is not None, (
             "positions is required for C128A metadata build"
         )
+        if current_platform.is_device_capability_family(120):
+            decode_lens, prefill_lens = build_c128a_hca_lens(
+                cm.positions[:num_total],
+                self.compress_ratio,
+                num_decode_tokens,
+                cm.slot_mapping,
+                self.c128a_decode_lens_buffer,
+                self.c128a_prefill_lens_buffer,
+                max_compressed_tokens=self.c128a_max_compressed,
+            )
+            result: dict[str, torch.Tensor | None] = {}
+            if num_decode_tokens > 0:
+                result["c128a_decode_hca_lens"] = decode_lens
+            if num_prefill_tokens > 0:
+                result["c128a_prefill_hca_lens"] = prefill_lens
+            return result
+
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],
@@ -1078,6 +1108,64 @@ def build_c128a_topk_metadata(
         BLOCK_SIZE=1024,
     )
     return global_decode, decode_lens, prefill_local
+
+
+def build_c128a_hca_lens(
+    positions: torch.Tensor,
+    compress_ratio: int,
+    num_decode_tokens: int,
+    slot_mapping: torch.Tensor,
+    decode_lens_buffer: torch.Tensor,
+    prefill_lens_buffer: torch.Tensor,
+    max_compressed_tokens: int = 8192,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build only C128A compressed-prefix lengths for the SM120 HCA path."""
+    num_tokens = positions.shape[0]
+    num_prefill_tokens = num_tokens - num_decode_tokens
+
+    decode_lens = decode_lens_buffer[:num_decode_tokens]
+    prefill_lens = prefill_lens_buffer[:num_prefill_tokens]
+
+    if num_tokens == 0:
+        return decode_lens, prefill_lens
+
+    _build_c128a_hca_lens_kernel[(num_tokens,)](
+        decode_lens_buffer,
+        prefill_lens_buffer,
+        positions,
+        compress_ratio,
+        max_compressed_tokens,
+        num_decode_tokens,
+        slot_mapping,
+    )
+    return decode_lens, prefill_lens
+
+
+@triton.jit
+def _build_c128a_hca_lens_kernel(
+    decode_lens_ptr,
+    prefill_lens_ptr,
+    positions_ptr,
+    compress_ratio,
+    max_compressed_tokens,
+    num_decode_tokens,
+    slot_mapping_ptr,
+):
+    token_idx = tl.program_id(0)
+    position = tl.load(positions_ptr + token_idx)
+    num_compressed = (position + 1) // compress_ratio
+    num_compressed = tl.minimum(num_compressed, max_compressed_tokens)
+    is_decode = token_idx < num_decode_tokens
+
+    if is_decode:
+        is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
+        tl.store(
+            decode_lens_ptr + token_idx,
+            tl.where(is_valid_token, num_compressed, 0),
+        )
+    else:
+        pfx_idx = token_idx - num_decode_tokens
+        tl.store(prefill_lens_ptr + pfx_idx, num_compressed)
 
 
 @triton.jit

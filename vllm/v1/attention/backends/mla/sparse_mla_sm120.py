@@ -4,7 +4,8 @@
 
 Counterpart to ``FlashInferMLASparseBackend`` (SM100 / datacenter Blackwell)
 and ``FlashMLASparseBackend`` (Hopper). Targets the V32 (DSv3.2 family) sparse
-MLA decode kernel shipped in FlashInfer (``BatchSparseMLAPagedAttentionWrapper``).
+MLA backend routed through FlashInfer's MLA wrapper with
+``backend="sparse-sm120"``.
 
 Same envelope as the FlashMLA path: ``fp8_ds_mla`` KV cache layout (656 B/token
 INLINE: 512 NoPE + 16 scales + 128 RoPE), head_size = 576, paged block_size =
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import numpy as np
 import torch
-from flashinfer import BatchSparseMLAPagedAttentionWrapper
+from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -72,7 +73,7 @@ def _get_decode_scratch(
 
 
 class SparseMLASm120Backend(AttentionBackend):
-    """SM120 FlashInfer sparse-MLA backend (BatchSparseMLAPagedAttentionWrapper).
+    """SM120 FlashInfer sparse-MLA backend.
 
     V32-family (DSv3.2 / GLM-5.1 / Kimi K2.5) — fp8_ds_mla KV cache, 576
     head_size, paged block_size = 64.
@@ -294,14 +295,17 @@ class SparseMLASm120Impl(SparseMLAAttentionImpl[SparseMLASm120Metadata]):
         )
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
 
-        # BatchSparseMLAPagedAttentionWrapper owns only the reusable LSE buffer.
+        # The FlashInfer MLA wrapper owns only the reusable LSE buffer.
         # Decode split-K scratch is borrowed from vLLM's shared workspace per
         # call, so it is not multiplied by the number of layers.
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self._wrapper = BatchSparseMLAPagedAttentionWrapper(
+        wrapper_device = torch.device("cuda", torch.cuda.current_device())
+        self._wrapper = BatchMLAPagedAttentionWrapper(
+            torch.empty(1, dtype=torch.int8, device=wrapper_device),
+            backend="sparse-sm120",
             max_num_tokens=max_tokens,
             max_num_heads=num_heads,
             d_v=self.kv_lora_rank,  # latent V dim (= 512 for V32 family)
@@ -371,7 +375,7 @@ class SparseMLASm120Impl(SparseMLAAttentionImpl[SparseMLASm120Metadata]):
                 topk_indices_physical.shape[-1],
             )
 
-        self._wrapper.run(
+        self._wrapper.run_sparse_mla(
             q=q,
             kv_cache=kv_cache_4d,
             indices=topk_indices_physical,

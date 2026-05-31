@@ -91,9 +91,9 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
-    # Consumer Blackwell (SM120) drives sparse-MLA through the flashinfer
-    # ``BatchSparseMLAPagedAttentionWrapper`` SM120 fast path; SM 9/10 stay
-    # on the Hopper FlashMLA sparse impl.
+    # Consumer Blackwell (SM120) drives sparse-MLA through FlashInfer's MLA
+    # wrapper with backend="sparse-sm120"; SM 9/10 stay on the Hopper FlashMLA
+    # sparse impl.
     cap = current_platform.get_device_capability()
     if cap is not None and cap.major == 12:
         from vllm.models.deepseek_v4.nvidia.sm120 import (
@@ -688,12 +688,22 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.max_model_len = vllm_config.model_config.max_model_len
 
         if _flashinfer_sparse_mla_AVAILABLE:
-            from flashinfer import BatchSparseMLAPagedAttentionWrapper
+            from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
-            self._sparse_mla_wrapper = BatchSparseMLAPagedAttentionWrapper(
+            max_hca_topk = 0
+            if self.compress_ratio == 128:
+                max_compressed = (
+                    self.max_model_len + self.compress_ratio - 1
+                ) // self.compress_ratio
+                max_hca_topk = ((max_compressed + 127) // 128) * 128
+            sparse_mla_device = torch.device("cuda", torch.cuda.current_device())
+            self._sparse_mla_wrapper = BatchMLAPagedAttentionWrapper(
+                torch.empty(1, dtype=torch.int8, device=sparse_mla_device),
+                backend="sparse-sm120",
                 max_num_tokens=self.max_num_batched_tokens,
                 max_num_heads=self.padded_heads,
                 d_v=512,
+                max_hca_topk=max_hca_topk,
             )
         else:
             self._sparse_mla_wrapper = None

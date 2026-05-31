@@ -475,7 +475,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         Returns a dict of keyword arguments to pass to the
         DeepseekSparseSWAMetadata constructor.
 
-        Note: C128A topk indices are computed by the FlashMLASparse builder
+        Note: C128A sparse metadata is computed by the FlashMLASparse builder
         (which owns the C128A block_table), not here.
         """
         result: dict[str, torch.Tensor | None] = {}

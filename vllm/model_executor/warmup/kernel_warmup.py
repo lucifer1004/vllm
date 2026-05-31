@@ -158,8 +158,8 @@ def _deepseek_v4_sparse_mla_decode_autotune(
         return False
 
     try:
-        from flashinfer import sparse_mla_sm120_decode_dsv4_autotune
         from flashinfer.autotuner import AutoTuner
+        from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4_autotune
     except ImportError:
         logger.warning(
             "Skipping DeepSeek V4 sparse MLA decode autotune because this "
