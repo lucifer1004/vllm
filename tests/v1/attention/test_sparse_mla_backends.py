@@ -95,10 +95,16 @@ def _validate_sm120_sparse_backend(
         )
 
 
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bfloat16", "fp8"])
-def test_sparse_mla_sm120_rejects_non_packed_fp8(kv_cache_dtype: str):
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bfloat16"])
+def test_sparse_mla_sm120_rejects_unsupported_kv_cache_dtype(kv_cache_dtype: str):
     reasons = _validate_sm120_sparse_backend(kv_cache_dtype)
     assert "kv_cache_dtype not supported" in reasons
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_ds_mla"])
+def test_sparse_mla_sm120_accepts_fp8_aliases(kv_cache_dtype: str):
+    reasons = _validate_sm120_sparse_backend(kv_cache_dtype)
+    assert reasons == []
 
 
 def test_sparse_mla_sm120_rejects_non_v32_topk():
@@ -237,13 +243,13 @@ def test_sparse_backend_decode_correctness(
         pytest.skip(f"{backend_cls.get_name()} does not support {kv_cache_dtype}")
 
     if (
-        backend_cls == FlashMLASparseBackend
+        backend_cls in (FlashMLASparseBackend, SparseMLASm120Backend)
         and kv_cache_dtype.startswith("fp8")
         and kv_cache_dtype != "fp8_ds_mla"
     ):
         pytest.skip(
-            "FlashMLA Sparse Attention backend fp8 only supports "
-            "fp8_ds_mla kv-cache dtype"
+            f"{backend_cls.get_name()} accepts fp8 at backend-selection time, "
+            "then MLAAttention converts it to fp8_ds_mla before impl construction"
         )
 
     supported_block_sizes = backend_cls.get_supported_kernel_block_sizes()

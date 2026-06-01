@@ -6,9 +6,9 @@ Counterpart to :class:`DeepseekV4FlashMLASparseImpl` (Hopper / SM10x). The
 forward path is driven by flashinfer's MLA wrapper with
 ``backend="sparse-sm120"``. It auto-dispatches decode (num_tokens <= 64) and
 prefill internally and accepts the SWA + compressed-indexer dual cache through
-its ``extra_kv_cache`` parameter. Non-HCA decode scratch is borrowed from
-vLLM's shared workspace so it is not multiplied by the number of layers; native
-HCA uses the FlashInfer wrapper's HCA scratch.
+its ``extra_kv_cache`` parameter. Decode scratch is borrowed from vLLM's
+shared workspace so large C128A contexts do not allocate per-layer split-K
+buffers.
 
 Selected by ``_select_v4_sparse_impl()`` in :mod:`vllm.models.deepseek_v4
 .attention` when the runtime compute capability is SM120; the
@@ -223,7 +223,6 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
 
         topk_indices = None
         topk_lens = None
-        hca_lens = None
         if not swa_only:
             if attn_metadata is None:
                 raise RuntimeError(
@@ -250,21 +249,26 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
-                # C128A/HCA: FlashInfer maps dense compressed-prefix lengths
-                # to paged slot IDs at launch time.
-                hca_lens = attn_metadata.c128a_decode_hca_lens
-                if hca_lens is None:
-                    raise RuntimeError("C128A/HCA decode metadata is missing.")
+                # C128A: pre-computed during metadata build.
+                topk_indices = attn_metadata.c128a_global_decode_topk_indices
+                topk_lens = attn_metadata.c128a_decode_topk_lens
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None
         assert swa_lens is not None
+        extra_topk = topk_indices.shape[-1] if topk_indices is not None else 0
+        mid_out, mid_lse = _get_decode_scratch(
+            num_decode_tokens,
+            q.shape[1],
+            output.shape[-1],
+            swa_indices.shape[-1],
+            extra_topk,
+        )
 
         # Treat queries in the same seq as independent queries (attended
         # purely by the generated indices). q arrives pre-padded to
         # layer.padded_heads by the outer wrapper.
-        num_heads = q.shape[1]
         q = q.unsqueeze(1)
         swa_cache = layer.swa_cache_layer.kv_cache.unsqueeze(-2)
         if kv_cache is not None:
@@ -274,41 +278,6 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             "DeepseekV4SM120SparseImpl requires layer._sparse_mla_wrapper; "
             "the flashinfer wrapper must be constructed in the layer __init__."
         )
-        if hca_lens is not None:
-            if attn_metadata is None:
-                raise RuntimeError("C128A/HCA decode metadata is missing.")
-            token_to_req_indices = swa_metadata.token_to_req_indices
-            if token_to_req_indices is None:
-                raise RuntimeError("C128A/HCA decode request mapping is missing.")
-            if kv_cache is None:
-                raise RuntimeError(
-                    "C128A/HCA decode requires the compressed KV cache, "
-                    "but layer.kv_cache is unavailable."
-                )
-            layer._sparse_mla_wrapper.run_sparse_mla_hca(
-                q=q,
-                kv_cache=swa_cache,
-                indices=swa_indices,
-                output=output,
-                sm_scale=layer.scale,
-                topk_length=swa_lens,
-                attn_sink=layer.attn_sink,
-                hca_kv_cache=kv_cache,
-                hca_lengths=hca_lens,
-                hca_block_table=attn_metadata.block_table[:num_decodes],
-                hca_token_to_req_indices=token_to_req_indices[:num_decode_tokens],
-            )
-            return
-
-        extra_topk = topk_indices.shape[-1] if topk_indices is not None else 0
-        mid_out, mid_lse = _get_decode_scratch(
-            num_decode_tokens,
-            num_heads,
-            output.shape[-1],
-            swa_indices.shape[-1],
-            extra_topk,
-        )
-
         layer._sparse_mla_wrapper.run_sparse_mla(
             q=q,
             kv_cache=swa_cache,
@@ -350,10 +319,8 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         prefill_token_base = query_start_loc_cpu[num_decodes]
 
         local_topk_indices: torch.Tensor | None
-        hca_lens: torch.Tensor | None
         if swa_only:
             local_topk_indices = None
-            hca_lens = None
         elif layer.compress_ratio == 4:
             if layer.topk_indices_buffer is None:
                 raise RuntimeError(
@@ -362,16 +329,11 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             local_topk_indices = layer.topk_indices_buffer[
                 num_decode_tokens : num_decode_tokens + num_prefill_tokens
             ]
-            hca_lens = None
         else:
-            # C128A/HCA: metadata stores lengths only; FlashInfer builds local
-            # dense slot IDs for each prefill chunk.
+            # C128A: pre-computed during metadata build.
             if attn_metadata is None:
-                raise RuntimeError("C128A/HCA prefill metadata is missing.")
-            local_topk_indices = None
-            hca_lens = attn_metadata.c128a_prefill_hca_lens
-            if hca_lens is None:
-                raise RuntimeError("C128A/HCA prefill metadata is missing.")
+                raise RuntimeError("C128A prefill metadata is missing.")
+            local_topk_indices = attn_metadata.c128a_prefill_topk_indices
 
         extra_topk_indices: torch.Tensor | None = None
         extra_topk_lens: torch.Tensor | None = None
@@ -435,28 +397,6 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 else None
             )
             chunk_tokens = query_end - query_start
-
-            if hca_lens is not None:
-                if extra_kv_paged is None:
-                    raise RuntimeError(
-                        "C128A/HCA prefill requires the compressed KV cache, "
-                        "but layer.kv_cache is unavailable."
-                    )
-                layer._sparse_mla_wrapper.run_sparse_mla_hca(
-                    q=q[query_start:query_end],
-                    kv_cache=swa_kv_paged,
-                    indices=swa_metadata.prefill_swa_indices[query_start:query_end],
-                    output=output[query_start:query_end],
-                    sm_scale=layer.scale,
-                    topk_length=swa_metadata.prefill_swa_lens[
-                        query_start:query_end
-                    ],
-                    attn_sink=layer.attn_sink,
-                    hca_kv_cache=extra_kv_paged,
-                    hca_lengths=hca_lens[query_start:query_end],
-                    return_lse=False,
-                )
-                continue
 
             mid_out = None
             mid_lse = None

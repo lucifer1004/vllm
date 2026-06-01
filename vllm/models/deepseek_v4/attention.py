@@ -690,12 +690,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if _flashinfer_sparse_mla_AVAILABLE:
             from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
-            max_hca_topk = 0
-            if self.compress_ratio == 128:
-                max_compressed = (
-                    self.max_model_len + self.compress_ratio - 1
-                ) // self.compress_ratio
-                max_hca_topk = ((max_compressed + 127) // 128) * 128
             sparse_mla_device = torch.device("cuda", torch.cuda.current_device())
             self._sparse_mla_wrapper = BatchMLAPagedAttentionWrapper(
                 torch.empty(1, dtype=torch.int8, device=sparse_mla_device),
@@ -703,7 +697,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 max_num_tokens=self.max_num_batched_tokens,
                 max_num_heads=self.padded_heads,
                 d_v=512,
-                max_hca_topk=max_hca_topk,
             )
         else:
             self._sparse_mla_wrapper = None

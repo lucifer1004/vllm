@@ -82,6 +82,7 @@ class SparseMLASm120Backend(AttentionBackend):
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "fp8",
         "fp8_ds_mla",
     ]
 
