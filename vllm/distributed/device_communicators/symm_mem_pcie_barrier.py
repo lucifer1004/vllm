@@ -84,6 +84,35 @@ _WORKSPACE_FLOOR = (
 _workspace_graveyard: list = []
 _orig_get_workspace: Callable[[str, int], torch.Tensor] | None = None
 
+# Debug sidecar (env-gated, not for commit): when barriers stop
+# completing, dump the host-side sequence counters and the handle's own
+# signal pad so the wedge can be attributed (missing peer writes vs
+# mismatched waits vs op-order divergence). All bookkeeping is gated on
+# _dbg_enabled and O(1) per call.
+_dbg_enabled = False
+_dbg_handles: dict[int, object] = {}  # own-pad VA -> latest handle
+_dbg_calls = 0
+
+# Pipeline event bracketing (env VLLM_SYMM_MEM_PIPELINE_TRACE): record a
+# CUDA event after every fused-pipeline stage; at a stall the sidecar
+# host-queries them and names the first stage that never completed —
+# no debugger involved (the SM120 debugger backend kills wedged
+# targets). Entries: (label, stream_id, event).
+_pipe_enabled = False
+_pipe_trace = None  # collections.deque, set at install
+_pipe_lock = threading.Lock()
+_orig_pipelined = None
+
+
+def _pipe_mark(label: str) -> None:
+    ev = torch.cuda.Event()
+    ev.record()
+    with _pipe_lock:
+        _pipe_trace.append(
+            (label, torch.cuda.current_stream().cuda_stream & 0xFFFF, ev)
+        )
+
+
 _MAX_CHANNELS = 8
 _RING = 4
 _lock = threading.Lock()
@@ -113,10 +142,18 @@ def _pcie_safe_barrier(self, channel: int = 0, timeout_ms: int = 0) -> None:
         )
 
     own_key = pad_ptrs[rank]
+    global _dbg_calls
     with _lock:
         chans = _seq_state.setdefault(own_key, {})
         seq = chans.get(channel, 0) + 1
         chans[channel] = seq
+        if _dbg_enabled:
+            # keyed by own-pad VA: handle wrappers are not identity-stable
+            # across calls (an unconditional identity-scan list here grew
+            # unboundedly and cost O(list) per barrier call — the fake "E
+            # perf regression" of 2026-07-08)
+            _dbg_calls += 1
+            _dbg_handles[own_key] = self
 
     stream = _drv.CUstream(torch.cuda.current_stream().cuda_stream)
     base = 4 * world * (channel * _RING + seq % _RING)
@@ -130,6 +167,8 @@ def _pcie_safe_barrier(self, channel: int = 0, timeout_ms: int = 0) -> None:
         )
         if int(err) != 0:
             raise RuntimeError(f"cuStreamWriteValue32 failed: {err}")
+    if _pipe_enabled:
+        _pipe_mark(f"bar(ch{channel},#{seq}).writes")
     for peer in range(world):
         (err,) = _drv.cuStreamWaitValue32(
             stream,
@@ -139,6 +178,8 @@ def _pcie_safe_barrier(self, channel: int = 0, timeout_ms: int = 0) -> None:
         )
         if int(err) != 0:
             raise RuntimeError(f"cuStreamWaitValue32 failed: {err}")
+    if _pipe_enabled:
+        _pipe_mark(f"bar(ch{channel},#{seq}).waits")
 
 
 def reset_pcie_barrier_state() -> None:
@@ -343,6 +384,160 @@ def _install_comm_stream_pipelines() -> None:
     )
 
 
+def _install_pipeline_trace() -> None:
+    """Wrap the fused-op pipeline so every stage records a CUDA event."""
+    global _orig_pipelined, _pipe_trace, _pipe_enabled
+    import collections
+
+    import torch.distributed._symmetric_memory as tsm
+
+    if _orig_pipelined is not None:
+        return
+    _pipe_trace = collections.deque(maxlen=512)
+    _orig_pipelined = tsm._pipelined_produce_and_all2all
+    op_counter = [0]
+
+    def traced(chunk_producer, output, group_name, out_chunk_dim=0):
+        op_counter[0] += 1
+        op = op_counter[0]
+
+        def wrapped_producer(dst_rank, buf):
+            chunk_producer(dst_rank, buf)
+            _pipe_mark(f"op{op}.producer->{dst_rank}")
+
+        _pipe_mark(f"op{op}.begin")
+        res = _orig_pipelined(wrapped_producer, output, group_name, out_chunk_dim)
+        _pipe_mark(f"op{op}.host-return")
+        return res
+
+    tsm._pipelined_produce_and_all2all = traced
+    _pipe_enabled = True
+    logger.info_once("symm-mem pipeline event bracketing enabled")
+
+
+# Single-stream fused pipelines (env VLLM_SYMM_MEM_SINGLE_STREAM_FUSED):
+# sequential replacements for torch's dual-stream micro-pipelines. torch
+# rides cross-rank barrier obligations on a backend stream and secures
+# the required kernel scheduling order with a sleep-kernel nudge its own
+# comments call "almost guarantee[d]". These variants keep the exact
+# buffer/channel discipline but issue everything in order on the current
+# stream: no backend stream, no cross-stream joins, no scheduling
+# assumptions — trading compute/comm overlap for a concurrency shape
+# with no intra-process concurrent peer enqueues. Used as a bisection
+# instrument for the driver enqueue wedge and as a candidate fallback.
+# (The rarely-hit *_last_dim all-gather variant is left stock.)
+
+
+def _single_stream_produce_and_all2all(
+    chunk_producer, output, group_name, out_chunk_dim=0
+):
+    import torch.distributed._symmetric_memory as tsm
+    import torch.distributed.distributed_c10d as c10d
+
+    out_chunks = output.chunk(
+        c10d._get_group_size_by_name(group_name), dim=out_chunk_dim
+    )
+    p2p_workspace_size_req = out_chunks[0].numel() * out_chunks[0].element_size() * 2
+    symm_mem = tsm.get_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
+    group_size = symm_mem.world_size
+    rank = symm_mem.rank
+
+    symm_mem.barrier(channel=0)
+
+    def get_p2p_buf(r: int, idx: int) -> torch.Tensor:
+        offset = 0 if idx == 0 else out_chunks[0].numel()
+        return symm_mem.get_buffer(r, out_chunks[0].shape, out_chunks[0].dtype, offset)
+
+    for step in range(1, group_size):
+        remote_rank = (rank - step) % group_size
+        # keep torch's step-parity -> buffer/channel pairing
+        buf_id = 1 if step % 2 == 0 else 0
+        chunk_producer((rank + step) % group_size, get_p2p_buf(rank, buf_id))
+        symm_mem.barrier(channel=step % 2)
+        out_chunks[remote_rank].copy_(get_p2p_buf(remote_rank, buf_id))
+        symm_mem.barrier(channel=step % 2)
+
+    chunk_producer(rank, out_chunks[rank])
+    symm_mem.barrier(channel=0)
+
+
+def _single_stream_multi_all_gather_and_consume(
+    shard, shard_consumer, ag_out, group_name, ag_out_needed=True
+):
+    import torch.distributed._symmetric_memory as tsm
+
+    p2p_workspace_size_req = 0
+    for x in shard:
+        p2p_workspace_size_req += x.numel() * x.element_size()
+    symm_mem = tsm.get_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
+    group_size = symm_mem.world_size
+    rank = symm_mem.rank
+
+    for x, y in zip(shard, ag_out):
+        assert x.is_contiguous()
+        assert y.is_contiguous()
+        assert x.shape[0] * group_size == y.shape[0]
+        assert x.shape[1:] == y.shape[1:]
+
+    symm_mem.barrier(channel=0)
+
+    def copy_shard(dst, src):
+        for d, s in zip(dst, src):
+            d.copy_(s)
+
+    def get_p2p_bufs(remote_rank):
+        offset_bytes = 0
+        bufs = []
+        for x in shard:
+            buf = symm_mem.get_buffer(
+                remote_rank,
+                x.shape,
+                x.dtype,
+                storage_offset=offset_bytes // x.element_size(),
+            )
+            bufs.append(buf)
+            offset_bytes += buf.numel() * buf.element_size()
+        return bufs
+
+    shards = [[] for _ in range(group_size)]
+    for x in ag_out:
+        for i, y in enumerate(x.chunk(group_size)):
+            shards[i].append(y)
+
+    copy_shard(get_p2p_bufs(rank), shard)
+    symm_mem.barrier(channel=1)
+
+    shard_consumer(shard, rank)
+    for step in range(1, group_size):
+        remote_rank = (step + rank) % group_size
+        copy_shard(shards[remote_rank], get_p2p_bufs(remote_rank))
+        shard_consumer(shards[remote_rank], remote_rank)
+
+    if ag_out_needed:
+        copy_shard(shards[rank], shard)
+
+    symm_mem.barrier(channel=0)
+
+
+def _install_single_stream_fused() -> None:
+    """Replace both fused micro-pipelines process-wide. Idempotent."""
+    global _orig_produce_a2a, _orig_multi_ag
+    import torch.distributed._symmetric_memory as tsm
+
+    if _orig_produce_a2a is not None:
+        return
+    _orig_produce_a2a = tsm._pipelined_produce_and_all2all
+    _orig_multi_ag = tsm._pipelined_multi_all_gather_and_consume
+    tsm._pipelined_produce_and_all2all = _single_stream_produce_and_all2all
+    tsm._pipelined_multi_all_gather_and_consume = (
+        _single_stream_multi_all_gather_and_consume
+    )
+    logger.info_once(
+        "torch fused-op micro-pipelines replaced with single-stream "
+        "sequential variants (VLLM_SYMM_MEM_SINGLE_STREAM_FUSED)."
+    )
+
+
 def install_pcie_safe_barrier() -> None:
     """Replace ``_SymmetricMemory.barrier`` process-wide. Idempotent."""
     global _installed, _orig_barrier, _drv
@@ -354,7 +549,15 @@ def install_pcie_safe_barrier() -> None:
     _orig_barrier = _SymmetricMemory.barrier
     _SymmetricMemory.barrier = _pcie_safe_barrier
     _install_workspace_guard()
-    _install_comm_stream_pipelines()
+    if os.getenv("VLLM_SYMM_MEM_STOCK_PIPELINES"):
+        logger.info_once(
+            "fused-op pipelines left stock "
+            "(VLLM_SYMM_MEM_STOCK_PIPELINES, dev override)."
+        )
+    elif os.getenv("VLLM_SYMM_MEM_SINGLE_STREAM_FUSED"):
+        _install_single_stream_fused()
+    else:
+        _install_comm_stream_pipelines()
     _installed = True
     workspace_floor_mib = _WORKSPACE_FLOOR // (1024 * 1024)
     logger.info_once(
@@ -362,3 +565,75 @@ def install_pcie_safe_barrier() -> None:
         "stream-memops protocol (no native P2P atomics on this platform); "
         f"fused-op workspace floored at {workspace_floor_mib} MiB with growth guard."
     )
+    if os.getenv("VLLM_SYMM_MEM_PIPELINE_TRACE"):
+        _install_pipeline_trace()
+    if os.getenv("VLLM_SYMM_MEM_BARRIER_DEBUG"):
+        global _dbg_enabled
+        _dbg_enabled = True
+        _start_debug_sidecar()
+
+
+def _start_debug_sidecar() -> None:
+    import time
+
+    def _watch():
+        # This thread issues D2H copies while the main thread may hold a
+        # global-mode cudagraph capture; relaxed mode makes those legal
+        # instead of poisoning the capture (run-8 lesson).
+        (err, _) = _drv.cuThreadExchangeStreamCaptureMode(
+            _drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+        )
+        if int(err) != 0:
+            logger.error("BARRIER DEBUG: relaxed capture mode failed: %s", err)
+            return
+        prev = -1
+        frozen = 0
+        while True:
+            time.sleep(20.0)
+            calls = _dbg_calls
+            # capture/decode phases legitimately pause fused ops; require
+            # a sustained freeze before dumping to cut false positives
+            frozen = frozen + 1 if (calls == prev and calls > 0) else 0
+            if frozen >= 3 and _dbg_handles:
+                try:
+                    dumps = []
+                    with _lock:
+                        handles = list(_dbg_handles.values())
+                        seqs = {hex(k): dict(v) for k, v in _seq_state.items()}
+                    for h in handles:
+                        pad_words = h.signal_pad_size // 4
+                        pad = h.get_signal_pad(h.rank, [pad_words], torch.int32)
+                        host = pad.cpu()
+                        nz = host.nonzero().flatten().tolist()
+                        vals = {i: int(host[i]) for i in nz[:120]}
+                        dumps.append((hex(h.signal_pad_ptrs[h.rank]), vals))
+                    logger.error(
+                        "BARRIER STALLED rank=%d calls=%d seqs=%s pads=%s",
+                        handles[0].rank,
+                        calls,
+                        seqs,
+                        dumps,
+                    )
+                    if _pipe_enabled and _pipe_trace:
+                        with _pipe_lock:
+                            entries = list(_pipe_trace)
+                        done_by_stream = {}
+                        pending = []
+                        for label, sid, ev in entries:
+                            if ev.query():
+                                done_by_stream[sid] = label
+                            else:
+                                pending.append(f"s{sid}:{label}")
+                        logger.error(
+                            "PIPELINE TRACE rank=%d last-complete=%s "
+                            "first-pending=%s (pending total %d)",
+                            handles[0].rank,
+                            done_by_stream,
+                            pending[:6],
+                            len(pending),
+                        )
+                except Exception as e:
+                    logger.error("BARRIER DEBUG failed: %r", e)
+            prev = calls
+
+    threading.Thread(target=_watch, daemon=True, name="pcie-barrier-dbg").start()
