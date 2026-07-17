@@ -28,6 +28,9 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import 
     is_valid_flashinfer_cutlass_fused_moe,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    activation_to_flashinfer_type,
+)
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 from vllm.utils.math_utils import next_power_of_2
@@ -119,6 +122,16 @@ def test_flashinfer_swigluoai_params_are_forwarded(activation, monkeypatch):
             call_args[name],
             torch.full((2,), value, device="cuda", dtype=torch.float32),
         )
+
+
+@pytest.mark.parametrize(
+    "activation",
+    [MoEActivation.SWIGLUOAI, MoEActivation.SWIGLUOAI_UNINTERLEAVE],
+)
+def test_flashinfer_swigluoai_activation_mapping(activation):
+    from flashinfer.fused_moe.core import ActivationType
+
+    assert activation_to_flashinfer_type(activation) == ActivationType.Swiglu
 
 
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
