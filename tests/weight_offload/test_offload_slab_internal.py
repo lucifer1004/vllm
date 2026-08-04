@@ -121,21 +121,24 @@ def test_cpu_slab_chunks_preserve_tensor_crossing_chunk_boundaries():
 
 
 def test_slab_chunk_ranges_rebalance_only_a_tiny_tail():
-    assert build_slab_chunk_ranges(
-        69, chunk_bytes=32, min_tail_bytes=8
-    ) == ((0, 32), (32, 61), (61, 69))
-    assert build_slab_chunk_ranges(
-        72, chunk_bytes=32, min_tail_bytes=8
-    ) == ((0, 32), (32, 64), (64, 72))
-    assert build_slab_chunk_ranges(
-        64, chunk_bytes=32, min_tail_bytes=8
-    ) == ((0, 32), (32, 64))
+    assert build_slab_chunk_ranges(69, chunk_bytes=32, min_tail_bytes=8) == (
+        (0, 32),
+        (32, 61),
+        (61, 69),
+    )
+    assert build_slab_chunk_ranges(72, chunk_bytes=32, min_tail_bytes=8) == (
+        (0, 32),
+        (32, 64),
+        (64, 72),
+    )
+    assert build_slab_chunk_ranges(64, chunk_bytes=32, min_tail_bytes=8) == (
+        (0, 32),
+        (32, 64),
+    )
 
 
 def test_slab_chunk_ranges_keep_single_small_slab_intact():
-    assert build_slab_chunk_ranges(
-        7, chunk_bytes=32, min_tail_bytes=8
-    ) == ((0, 7),)
+    assert build_slab_chunk_ranges(7, chunk_bytes=32, min_tail_bytes=8) == ((0, 7),)
 
 
 def test_static_buffer_pool_reuses_one_slab_per_module_layout():

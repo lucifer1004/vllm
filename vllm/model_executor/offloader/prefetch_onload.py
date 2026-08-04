@@ -98,9 +98,7 @@ def run_onload_to_static(
                 copy_and_record(dst, src, num_bytes)
                 return
             paced_copy_items.extend(
-                iter_chunked_tensor_views(
-                    dst, src, num_bytes, PREFETCH_H2D_CHUNK_BYTES
-                )
+                iter_chunked_tensor_views(dst, src, num_bytes, PREFETCH_H2D_CHUNK_BYTES)
             )
 
         # Fork: record event on compute stream, copy_stream waits on it.

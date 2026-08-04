@@ -164,9 +164,7 @@ class TailCopyScheduler:
         """Register a collective's GPU lifetime without blocking its launch."""
         stream_id = int(stream.cuda_stream)
         with self._condition:
-            windows = self._collective_windows_by_stream.setdefault(
-                stream_id, deque()
-            )
+            windows = self._collective_windows_by_stream.setdefault(stream_id, deque())
             windows.append(CollectiveWindow(start_event, done_event))
             self._condition.notify_all()
 

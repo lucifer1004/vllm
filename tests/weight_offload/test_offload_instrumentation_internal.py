@@ -21,6 +21,7 @@ from vllm.model_executor.offloader.prefetch_diagnostics import (
 )
 from vllm.model_executor.offloader.prefetch_helpers import nvtx_range
 from vllm.model_executor.offloader.prefetch_tail_copy import (
+    TailCopyJob,
     is_wraparound_prefetch,
     iter_chunked_tensor_views,
 )
@@ -251,7 +252,7 @@ def test_comm_aware_prefetch_paces_regular_copies(monkeypatch):
         lambda stream: contextlib.nullcontext(),
     )
 
-    submitted = []
+    submitted: list[TailCopyJob] = []
     cpu_slab = torch.arange(10, dtype=torch.uint8)
     offloader = _ModuleOffloader.__new__(_ModuleOffloader)
     offloader.copy_stream = _RecordingCudaStream()

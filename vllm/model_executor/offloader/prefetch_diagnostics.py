@@ -45,10 +45,7 @@ def should_log_prefetch_schedule() -> bool:
 
 
 def should_collect_prefetch_debug_metadata() -> bool:
-    return (
-        envs.VLLM_PREFETCH_LOG_SCHEDULE
-        or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
-    )
+    return envs.VLLM_PREFETCH_LOG_SCHEDULE or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
 
 
 @dataclass
@@ -180,9 +177,7 @@ def build_prefetch_copy_segments(
     for group_info in module_offloader._storage_group_infos:
         source = group_info.cpu_source
         segments.append(
-            PrefetchCopySegment(
-                "storage_group", source.numel() * source.element_size()
-            )
+            PrefetchCopySegment("storage_group", source.numel() * source.element_size())
         )
     for name in module_offloader._direct_param_names:
         storage = module_offloader._param_offloaders[name]._cpu_storage
@@ -367,9 +362,7 @@ def build_prefetch_manifest(
         "tail_copy_chunk_bytes": TAIL_PREFETCH_H2D_CHUNK_BYTES,
         "comm_aware": envs.VLLM_PREFETCH_COMM_AWARE,
         "regular_copy_chunk_bytes": (
-            PREFETCH_H2D_CHUNK_BYTES
-            if envs.VLLM_PREFETCH_COMM_AWARE
-            else None
+            PREFETCH_H2D_CHUNK_BYTES if envs.VLLM_PREFETCH_COMM_AWARE else None
         ),
         "total_offloaded_bytes": total_offloaded_bytes,
         "runtime_buffer_bytes": runtime_buffer_bytes,

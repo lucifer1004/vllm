@@ -57,6 +57,7 @@ Known constraints:
 
 import os
 import threading
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -81,7 +82,7 @@ logger = init_logger(__name__)
 _WORKSPACE_FLOOR = (
     int(os.getenv("VLLM_SYMM_MEM_WORKSPACE_FLOOR_MB", "256")) * 1024 * 1024
 )
-_workspace_graveyard: list = []
+_workspace_graveyard: list[torch.Tensor] = []
 _orig_get_workspace: Callable[[str, int], torch.Tensor] | None = None
 
 # Debug sidecar (env-gated, not for commit): when barriers stop
@@ -90,7 +91,7 @@ _orig_get_workspace: Callable[[str, int], torch.Tensor] | None = None
 # mismatched waits vs op-order divergence). All bookkeeping is gated on
 # _dbg_enabled and O(1) per call.
 _dbg_enabled = False
-_dbg_handles: dict[int, object] = {}  # own-pad VA -> latest handle
+_dbg_handles: dict[int, _SymmetricMemory] = {}  # own-pad VA -> latest handle
 _dbg_calls = 0
 
 # Pipeline event bracketing (env VLLM_SYMM_MEM_PIPELINE_TRACE): record a
@@ -99,7 +100,7 @@ _dbg_calls = 0
 # no debugger involved (the SM120 debugger backend kills wedged
 # targets). Entries: (label, stream_id, event).
 _pipe_enabled = False
-_pipe_trace = None  # collections.deque, set at install
+_pipe_trace: deque[tuple[str, int, torch.cuda.Event]] | None = None
 _pipe_lock = threading.Lock()
 _orig_pipelined = None
 
@@ -108,6 +109,7 @@ def _pipe_mark(label: str) -> None:
     ev = torch.cuda.Event()
     ev.record()
     with _pipe_lock:
+        assert _pipe_trace is not None
         _pipe_trace.append(
             (label, torch.cuda.current_stream().cuda_stream & 0xFFFF, ev)
         )
@@ -123,7 +125,9 @@ _orig_barrier = None
 _drv: Any = None
 
 
-def _pcie_safe_barrier(self, channel: int = 0, timeout_ms: int = 0) -> None:
+def _pcie_safe_barrier(
+    self: _SymmetricMemory, channel: int = 0, timeout_ms: int = 0
+) -> None:
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "The PCIe-safe symm-mem barrier cannot be captured in a CUDA "
@@ -387,13 +391,12 @@ def _install_comm_stream_pipelines() -> None:
 def _install_pipeline_trace() -> None:
     """Wrap the fused-op pipeline so every stage records a CUDA event."""
     global _orig_pipelined, _pipe_trace, _pipe_enabled
-    import collections
 
     import torch.distributed._symmetric_memory as tsm
 
     if _orig_pipelined is not None:
         return
-    _pipe_trace = collections.deque(maxlen=512)
+    _pipe_trace = deque(maxlen=512)
     _orig_pipelined = tsm._pipelined_produce_and_all2all
     op_counter = [0]
 
@@ -499,7 +502,7 @@ def _single_stream_multi_all_gather_and_consume(
             offset_bytes += buf.numel() * buf.element_size()
         return bufs
 
-    shards = [[] for _ in range(group_size)]
+    shards: list[list[torch.Tensor]] = [[] for _ in range(group_size)]
     for x in ag_out:
         for i, y in enumerate(x.chunk(group_size)):
             shards[i].append(y)

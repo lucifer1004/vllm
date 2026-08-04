@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import torch
 
-
 PINNED_CPU_SLAB_CHUNK_BYTES = 2 * 1024**3
 PINNED_CPU_SLAB_MIN_TAIL_BYTES = 128 * 1024**2
 
