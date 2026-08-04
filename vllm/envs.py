@@ -285,6 +285,7 @@ if TYPE_CHECKING:
     VLLM_PREFETCH_LOG_TRANSFER_STATS: bool = False
     VLLM_PREFETCH_LOG_OFFLOADED_PARAMS: bool = False
     VLLM_PREFETCH_LOG_SCHEDULE: bool = False
+    VLLM_PREFETCH_COMM_AWARE: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
@@ -2008,6 +2009,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log per-forward H2D transfer stats for prefetch offload.
     "VLLM_PREFETCH_LOG_TRANSFER_STATS": lambda: bool(
         int(os.getenv("VLLM_PREFETCH_LOG_TRANSFER_STATS", "0"))
+    ),
+    # Pace regular prefetch copies and gate them around active TP collectives.
+    "VLLM_PREFETCH_COMM_AWARE": lambda: bool(
+        int(os.getenv("VLLM_PREFETCH_COMM_AWARE", "0"))
     ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(

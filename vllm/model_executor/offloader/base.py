@@ -90,6 +90,11 @@ class BaseOffloader(ABC):
         """Join streams after forward. Override in subclasses."""
         pass
 
+    @contextmanager
+    def gate_h2d_for_collective(self) -> Generator[None, None, None]:
+        """Gate paced H2D work during an active device collective."""
+        yield
+
     def begin_forward_stats(self) -> None:  # noqa: B027
         """Start optional per-forward instrumentation."""
         pass

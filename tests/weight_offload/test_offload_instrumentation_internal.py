@@ -13,7 +13,9 @@ from vllm.model_executor.offloader.prefetch import (
     _ModuleOffloader,
 )
 from vllm.model_executor.offloader.prefetch_diagnostics import (
+    PrefetchCopySegment,
     PrefetchScheduleRow,
+    build_prefetch_manifest,
     build_prefetch_schedule_rows,
     log_prefetch_schedule,
 )
@@ -23,7 +25,10 @@ from vllm.model_executor.offloader.prefetch_tail_copy import (
     iter_chunked_tensor_views,
 )
 from vllm.model_executor.offloader.runtime import PrefetchRuntimeController
-from vllm.model_executor.offloader.slab import CpuSlabChunk
+from vllm.model_executor.offloader.slab import (
+    CpuSlabChunk,
+    build_slab_layout,
+)
 
 
 class _FakeStream:
@@ -214,6 +219,69 @@ def test_prefetch_start_passes_tail_hint_to_module_onload():
     offloader._start_prefetch(0, is_tail_prefetch=True)
 
     assert calls == [False, True]
+
+
+def test_comm_aware_prefetch_paces_regular_copies(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.prefetch_onload.envs.VLLM_PREFETCH_COMM_AWARE",
+        True,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.prefetch_onload.PREFETCH_H2D_CHUNK_BYTES",
+        4,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.prefetch_onload.should_pin_memory",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.prefetch_onload.torch.cuda.is_current_stream_capturing",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.prefetch_onload.torch.cuda.Event",
+        lambda *args, **kwargs: _RecordingCudaEvent(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.prefetch_onload.torch.cuda.current_stream",
+        lambda: _RecordingCudaStream(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.prefetch_onload.torch.cuda.stream",
+        lambda stream: contextlib.nullcontext(),
+    )
+
+    submitted = []
+    cpu_slab = torch.arange(10, dtype=torch.uint8)
+    offloader = _ModuleOffloader.__new__(_ModuleOffloader)
+    offloader.copy_stream = _RecordingCudaStream()
+    offloader.transfer_stats = PrefetchTransferStats()
+    offloader.layer_idx = 0
+    offloader.module_index = 2
+    offloader._buffer_slot_idx = 0
+    offloader._copy_done_event = _RecordingCudaEvent()
+    offloader._event_valid_for_eager = False
+    offloader._copy_thread_error = None
+    offloader._copy_done_event_recorded = SimpleNamespace(
+        wait=lambda: None, clear=lambda: None, set=lambda: None
+    )
+    offloader._tail_copy_scheduler = SimpleNamespace(submit=submitted.append)
+    offloader._use_slab_copy = True
+    offloader._slab_param_names = ("weight",)
+    offloader._storage_group_infos = ()
+    offloader._storage_group_buffers = []
+    offloader._direct_param_names = ()
+    offloader._cpu_slab_chunks = (CpuSlabChunk(0, cpu_slab),)
+    offloader._gpu_slab = torch.empty_like(cpu_slab)
+    offloader._param_offloaders = {
+        "weight": _FakeParamOffloader(torch.ones(1, dtype=torch.float16))
+    }
+
+    in_capture = offloader.start_onload_to_static(allow_paced_chunking=False)
+
+    assert in_capture is False
+    assert len(submitted) == 1
+    assert [item[2] for item in submitted[0].copy_items] == [4, 4, 2]
 
 
 def test_prefetch_transfer_stats_defers_copy_timing_queries_during_capture():
@@ -569,6 +637,72 @@ def test_prefetch_schedule_logging_enabled(monkeypatch):
     assert "initial -> load layer 0 into slot 0" in table
     assert "after layer 0 -> load layer 16 into slot 0" in table
     assert "after layer 16 -> load layer 0 into slot 0" in table
+
+
+def test_prefetch_manifest_reports_positions_layouts_and_copy_segments(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.prefetch_diagnostics.envs."
+        "VLLM_PREFETCH_COMM_AWARE",
+        True,
+    )
+    modules = tuple(torch.nn.Linear(2, 2, bias=False) for _ in range(4))
+    runtime = PrefetchRuntimeController(unit_count=2, prefetch_step=1)
+    plan_units = (
+        SimpleNamespace(module_index=1),
+        SimpleNamespace(module_index=3),
+    )
+
+    module_offloaders = []
+    for module_index in (1, 3):
+        cpu_storage = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        layout = build_slab_layout([("weight", cpu_storage)])
+        segment = PrefetchCopySegment("slab_chunk", layout.total_bytes)
+        module_offloaders.append(
+            SimpleNamespace(
+                module_index=module_index,
+                offloaded_bytes=layout.total_bytes,
+                direct_buffer_bytes=0,
+                uses_slab_buffers=True,
+                uses_storage_group_fallback=False,
+                _use_slab_copy=True,
+                _cpu_slab_chunks=(
+                    CpuSlabChunk(0, cpu_storage.view(torch.uint8).reshape(-1)),
+                ),
+                _slab_layout=layout,
+                _storage_group_infos=(),
+                _direct_param_names=(),
+                _copy_segments=(segment,),
+            )
+        )
+
+    manifest = build_prefetch_manifest(
+        plan_units,
+        runtime,
+        module_offloaders,
+        modules,
+        group_size=2,
+        num_in_group=1,
+        prefetch_step=1,
+        selectors=set(),
+        include_names={"weight"},
+        total_offloaded_bytes=32,
+        runtime_buffer_bytes=16,
+    )
+
+    assert manifest["module_count"] == 4
+    assert manifest["comm_aware"] is True
+    assert manifest["regular_copy_chunk_bytes"] == 128 * 1024 * 1024
+    position_bytes = [
+        position["logical_parameter_bytes"] for position in manifest["positions"]
+    ]
+    assert position_bytes == [16, 16, 16, 16]
+    assert len(manifest["pooled_buffer_layouts"]) == 1
+    assert manifest["pooled_buffer_layouts"][0]["unit_indices"] == [0, 1]
+    assert manifest["units"][0]["copy_segments"] == [
+        {"kind": "slab_chunk", "bytes": 16}
+    ]
+    assert manifest["units"][0]["prefetch_after_unit_idx"] == 1
+    assert manifest["units"][0]["loaded_after_unit_idx"] == 1
 
 
 @pytest.mark.parametrize(

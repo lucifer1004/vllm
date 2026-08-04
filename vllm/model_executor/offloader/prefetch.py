@@ -12,11 +12,14 @@ graph captures, ensuring H2D copies are properly captured.
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
+
+import vllm.envs as envs
 
 # Import prefetch_ops to register custom ops at module load time
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
@@ -26,10 +29,14 @@ from vllm.model_executor.offloader import prefetch_offloader_ext as ext
 from vllm.model_executor.offloader.base import BaseOffloader, should_pin_memory
 from vllm.model_executor.offloader.planner import OffloadUnit, should_offload_module
 from vllm.model_executor.offloader.prefetch_diagnostics import (
+    PrefetchCopySegment,
     PrefetchScheduleRow,  # noqa: F401  (re-exported)
     PrefetchTransferStats,
+    build_prefetch_copy_segments,
+    log_prefetch_manifest,
     log_prefetch_offload_plan,
     log_prefetch_schedule,
+    should_collect_prefetch_debug_metadata,
 )
 from vllm.model_executor.offloader.prefetch_helpers import (
     maybe_bind_process_to_current_gpu_numa,
@@ -134,6 +141,8 @@ class PrefetchOffloader(BaseOffloader):
         self.total_offloaded_bytes = 0
         self._static_runtime_buffer_bytes = 0
         self.transfer_stats = PrefetchTransferStats()
+        self._diagnostic_modules: tuple[nn.Module, ...] = ()
+        self._diagnostic_plan_units: tuple[OffloadUnit, ...] = ()
 
     def wrap_modules(
         self,
@@ -187,6 +196,7 @@ class PrefetchOffloader(BaseOffloader):
                     tail_copy_scheduler=self.tail_copy_scheduler,
                     whitelist_param_names=list(unit.param_names),
                     layer_idx=len(units) - 1,
+                    module_index=unit.module_index,
                     transfer_stats=self.transfer_stats,
                 )
             )
@@ -195,6 +205,9 @@ class PrefetchOffloader(BaseOffloader):
             unit_count=len(units),
             prefetch_step=self.prefetch_step,
         )
+        if should_collect_prefetch_debug_metadata():
+            self._diagnostic_modules = tuple(modules)
+            self._diagnostic_plan_units = tuple(units)
         log_prefetch_offload_plan(units)
         log_prefetch_schedule(units, self.runtime, module_count=len(modules))
 
@@ -258,8 +271,12 @@ class PrefetchOffloader(BaseOffloader):
         1. sync_before_graph_capture() ensures pre-capture work is complete
         2. We can't wait on pre-capture events during capture (isolation error)
         """
-        with nvtx_range(f"weight_offload.wait unit={layer_idx}"):
-            offloader = self.module_offloaders[layer_idx]
+        offloader = self.module_offloaders[layer_idx]
+        with nvtx_range(
+            f"weight_offload.wait unit={layer_idx} "
+            f"position={getattr(offloader, 'module_index', -1)} "
+            f"slot={getattr(offloader, '_buffer_slot_idx', -1)}"
+        ):
             assert self.runtime is not None, "Runtime controller not initialized"
 
             if torch.cuda.is_current_stream_capturing():
@@ -310,11 +327,15 @@ class PrefetchOffloader(BaseOffloader):
         is_tail_prefetch: bool = False,
     ):
         """Called by custom op - start async copy to static buffer."""
+        offloader = self.module_offloaders[layer_idx]
         with nvtx_range(
             f"weight_offload.start_prefetch unit={layer_idx} "
+            f"position={getattr(offloader, 'module_index', -1)} "
+            f"slot={getattr(offloader, '_buffer_slot_idx', -1)} "
+            f"bytes={getattr(offloader, '_h2d_bytes_per_prefetch', 0)} "
+            f"segments={len(getattr(offloader, '_copy_segments', ()))} "
             f"tail={int(is_tail_prefetch)}"
         ):
-            offloader = self.module_offloaders[layer_idx]
             assert self.runtime is not None, "Runtime controller not initialized"
             previous_owner = self.runtime.begin_prefetch(layer_idx)
             if previous_owner is not None:
@@ -350,6 +371,18 @@ class PrefetchOffloader(BaseOffloader):
             )
             ext.flush_transfer_timings(self, skip_query=True)
             self.runtime.mark_waited(runtime_unit.unit_idx)
+
+    @contextmanager
+    def gate_h2d_for_collective(self) -> Generator[None, None, None]:
+        """Gate paced copies while a TP collective is active on the GPU."""
+        if (
+            not envs.VLLM_PREFETCH_COMM_AWARE
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            yield
+            return
+        with self.tail_copy_scheduler.gate_for_collective():
+            yield
 
     def post_init(self):
         """Allocate static buffer pool and start initial prefetches.
@@ -392,6 +425,21 @@ class PrefetchOffloader(BaseOffloader):
             f"prefetch_step={self.prefetch_step}, mode={self.mode})"
         )
 
+        assert self.runtime is not None, "Runtime controller not initialized"
+        log_prefetch_manifest(
+            getattr(self, "_diagnostic_plan_units", ()),
+            self.runtime,
+            self.module_offloaders,
+            getattr(self, "_diagnostic_modules", ()),
+            group_size=self.group_size,
+            num_in_group=self.num_in_group,
+            prefetch_step=self.prefetch_step,
+            selectors=getattr(self, "offload_selectors", set()),
+            include_names=getattr(self, "offload_params", set()),
+            total_offloaded_bytes=self.total_offloaded_bytes,
+            runtime_buffer_bytes=self.static_runtime_buffer_bytes,
+        )
+
         self._start_initial_prefetches()
 
     @property
@@ -427,6 +475,7 @@ class _ModuleOffloader:
         tail_copy_scheduler: TailCopyScheduler,
         whitelist_param_names: list[str],
         layer_idx: int,
+        module_index: int,
         transfer_stats: PrefetchTransferStats,
     ):
         self.mode = mode
@@ -435,8 +484,11 @@ class _ModuleOffloader:
         self.copy_stream = copy_stream
         self._tail_copy_scheduler = tail_copy_scheduler
         self.layer_idx = layer_idx
+        self.module_index = module_index
         self.offloaded_bytes = 0
         self.transfer_stats = transfer_stats
+        self._copy_segments: tuple[PrefetchCopySegment, ...] = ()
+        self._h2d_bytes_per_prefetch = 0
 
         # Event to signal when H2D copy to static buffer is complete.
         # Used for per-layer synchronization (both eager and capture modes).
@@ -488,6 +540,11 @@ class _ModuleOffloader:
         for param_offloader in self._param_offloaders.values():
             param_offloader.post_init()
             self.offloaded_bytes += param_offloader.offloaded_bytes
+        if should_collect_prefetch_debug_metadata():
+            self._copy_segments = build_prefetch_copy_segments(self)
+            self._h2d_bytes_per_prefetch = sum(
+                segment.num_bytes for segment in self._copy_segments
+            )
 
     def sync_cpu_storage(self):
         """Sync CPU storage with current param.data.
