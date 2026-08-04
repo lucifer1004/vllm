@@ -23,6 +23,7 @@ from vllm.model_executor.offloader.prefetch_tail_copy import (
     iter_chunked_tensor_views,
 )
 from vllm.model_executor.offloader.runtime import PrefetchRuntimeController
+from vllm.model_executor.offloader.slab import CpuSlabChunk
 
 
 class _FakeStream:
@@ -571,15 +572,22 @@ def test_prefetch_schedule_logging_enabled(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("use_slab_copy", "expected_copy_count", "expected_h2d_bytes"),
+    (
+        "use_slab_copy",
+        "chunk_sizes",
+        "expected_copy_count",
+        "expected_h2d_bytes",
+    ),
     [
-        (True, 1, 24),
-        (False, 2, 24),
+        (True, (24,), 1, 24),
+        (True, (12, 12), 2, 24),
+        (False, (24,), 2, 24),
     ],
 )
-def test_module_onload_uses_one_slab_copy_for_packable_tensors(
+def test_module_onload_copies_cpu_slab_chunks_to_one_gpu_slab(
     monkeypatch,
     use_slab_copy: bool,
+    chunk_sizes: tuple[int, ...],
     expected_copy_count: int,
     expected_h2d_bytes: int,
 ):
@@ -624,7 +632,12 @@ def test_module_onload_uses_one_slab_copy_for_packable_tensors(
     offloader._storage_group_buffers = []
     offloader._direct_param_names = ()
     offloader._buffer_pool = object()
-    offloader._cpu_slab = torch.arange(24, dtype=torch.uint8)
+    cpu_slab = torch.arange(24, dtype=torch.uint8)
+    chunk_offsets = [sum(chunk_sizes[:idx]) for idx in range(len(chunk_sizes))]
+    offloader._cpu_slab_chunks = tuple(
+        CpuSlabChunk(offset, cpu_slab[offset : offset + size])
+        for offset, size in zip(chunk_offsets, chunk_sizes)
+    )
     offloader._gpu_slab = torch.empty(24, dtype=torch.uint8)
     # uses_slab_buffers / uses_storage_group_fallback / uses_direct_fallback
     # are properties on the class; the manual instance state above already
@@ -642,6 +655,8 @@ def test_module_onload_uses_one_slab_copy_for_packable_tensors(
     assert len(transfer_stats._pending_copy_events) == expected_copy_count
     assert [p.ensure_count for p in offloader._param_offloaders.values()] == [1, 1]
     assert [p.synced_count for p in offloader._param_offloaders.values()] == [1, 1]
+    if use_slab_copy:
+        assert torch.equal(offloader._gpu_slab, cpu_slab)
 
 
 def test_module_onload_does_not_record_timing_events_during_capture(monkeypatch):
@@ -685,7 +700,8 @@ def test_module_onload_does_not_record_timing_events_during_capture(monkeypatch)
     offloader._storage_group_buffers = []
     offloader._direct_param_names = ()
     offloader._buffer_pool = object()
-    offloader._cpu_slab = torch.arange(8, dtype=torch.uint8)
+    cpu_slab = torch.arange(8, dtype=torch.uint8)
+    offloader._cpu_slab_chunks = (CpuSlabChunk(0, cpu_slab),)
     offloader._gpu_slab = torch.empty(8, dtype=torch.uint8)
     offloader._param_offloaders = {
         "a": _FakeParamOffloader(torch.ones(4, dtype=torch.float16)),

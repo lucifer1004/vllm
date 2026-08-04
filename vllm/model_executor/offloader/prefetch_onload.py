@@ -107,16 +107,20 @@ def run_onload_to_static(
                 offloader.ensure_cpu_master_freshness()
 
             if module_offloader.uses_slab_buffers and module_offloader._use_slab_copy:
-                cpu_slab = module_offloader._cpu_slab
                 gpu_slab = module_offloader._gpu_slab
-                assert cpu_slab is not None and gpu_slab is not None
-                assert not should_pin_memory() or cpu_slab.is_pinned(), (
-                    "CPU slab is not pinned! "
-                    "non_blocking=True H2D copy from non-pinned memory "
-                    "causes stream synchronization that breaks "
-                    "event-based fork synchronization."
-                )
-                copy_or_defer(gpu_slab, cpu_slab, cpu_slab.numel())
+                assert gpu_slab is not None
+                for chunk in module_offloader._cpu_slab_chunks:
+                    cpu_chunk = chunk.data
+                    assert not should_pin_memory() or cpu_chunk.is_pinned(), (
+                        "CPU slab chunk is not pinned! "
+                        "non_blocking=True H2D copy from non-pinned memory "
+                        "causes stream synchronization that breaks "
+                        "event-based fork synchronization."
+                    )
+                    gpu_chunk = gpu_slab[
+                        chunk.offset_bytes : chunk.offset_bytes + cpu_chunk.numel()
+                    ]
+                    copy_or_defer(gpu_chunk, cpu_chunk, cpu_chunk.numel())
             elif module_offloader.uses_slab_buffers:
                 for name in module_offloader._slab_param_names:
                     p = module_offloader._param_offloaders[name]

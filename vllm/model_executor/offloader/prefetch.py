@@ -50,7 +50,7 @@ from vllm.model_executor.offloader.prefetch_tail_copy import (
 )
 from vllm.model_executor.offloader.runtime import PrefetchRuntimeController
 from vllm.model_executor.offloader.selectors import select_module_parameters
-from vllm.model_executor.offloader.slab import SlabLayout
+from vllm.model_executor.offloader.slab import CpuSlabChunk, SlabLayout
 from vllm.utils.torch_utils import get_dtype_size
 
 logger = init_logger(__name__)
@@ -462,7 +462,7 @@ class _ModuleOffloader:
         # Three-tier runtime buffer state, finalized by _refresh_runtime_buffer_strategy
         self._slab_param_names: tuple[str, ...] = ()
         self._slab_layout: SlabLayout | None = None
-        self._cpu_slab: torch.Tensor | None = None
+        self._cpu_slab_chunks: tuple[CpuSlabChunk, ...] = ()
         self._gpu_slab: torch.Tensor | None = None
         self._storage_group_infos: tuple[StorageGroupInfo, ...] = ()
         self._storage_group_buffers: list[torch.Tensor] = []
