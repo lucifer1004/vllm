@@ -669,16 +669,6 @@ class DeepseekV4MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts or 0
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        assert self.n_physical_experts % self.tp_size == 0, (
-            f"n_physical_experts={self.n_physical_experts} must be divisible by "
-            f"tp_size={self.tp_size}. Adjust num_redundant_experts."
-        )
-        self.n_local_physical_experts = self.n_physical_experts // self.tp_size
-        self.n_local_experts = self.n_local_physical_experts
-        self.experts_start_idx = self.tp_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.physical_expert_start = self.experts_start_idx
-        self.physical_expert_end = self.experts_end_idx
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
@@ -700,6 +690,24 @@ class DeepseekV4MoE(nn.Module):
             num_redundant_experts=eplb_config.num_redundant_experts,
             is_sequence_parallel=self.use_sequence_parallel,
         )
+        self._sync_fused_expert_metadata()
+
+    def _sync_fused_expert_metadata(self) -> None:
+        expert_map_manager = self.experts.expert_map_manager
+        local_expert_ids = expert_map_manager.get_local_expert_ids()
+        if not local_expert_ids:
+            raise ValueError("DeepSeek V4 MoE requires at least one local expert.")
+
+        self.local_expert_ids = tuple(local_expert_ids)
+        self.n_local_experts = expert_map_manager.local_num_experts
+        self.n_local_physical_experts = self.n_local_experts
+
+        # These bounds are retained for model-level metadata consumers. The
+        # expert map manager remains authoritative for non-contiguous placement.
+        self.experts_start_idx = local_expert_ids[0]
+        self.experts_end_idx = local_expert_ids[-1] + 1
+        self.physical_expert_start = self.experts_start_idx
+        self.physical_expert_end = self.experts_end_idx
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None

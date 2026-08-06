@@ -8,6 +8,7 @@ import torch
 
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MegaMoEExperts,
+    DeepseekV4MoE,
     make_deepseek_v4_expert_params_mapping,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
@@ -30,6 +31,34 @@ def test_deepseek_v4_mega_moe_expert_mapping():
         ("experts.w2_", "experts.1.w2.", 1, "w2"),
         ("experts.w13_", "experts.1.w3.", 1, "w3"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("local_expert_ids", "expected_bounds"),
+    [
+        (list(range(256)), (0, 256)),
+        (list(range(64, 128)), (64, 128)),
+        (list(range(1, 256, 4)), (1, 254)),
+    ],
+)
+def test_deepseek_v4_fused_moe_uses_expert_map_manager(
+    local_expert_ids: list[int], expected_bounds: tuple[int, int]
+) -> None:
+    expert_map_manager = SimpleNamespace(
+        local_num_experts=len(local_expert_ids),
+        get_local_expert_ids=lambda: local_expert_ids,
+    )
+    moe = SimpleNamespace(
+        experts=SimpleNamespace(expert_map_manager=expert_map_manager)
+    )
+
+    DeepseekV4MoE._sync_fused_expert_metadata(moe)  # type: ignore[arg-type]
+
+    assert moe.local_expert_ids == tuple(local_expert_ids)
+    assert moe.n_local_experts == len(local_expert_ids)
+    assert moe.n_local_physical_experts == len(local_expert_ids)
+    assert (moe.experts_start_idx, moe.experts_end_idx) == expected_bounds
+    assert (moe.physical_expert_start, moe.physical_expert_end) == expected_bounds
 
 
 def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
