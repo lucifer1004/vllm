@@ -7,6 +7,17 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
+# The rejection sampler keys both its acceptance uniform and recovery Gumbel
+# noise by token position. Draft proposals must use a disjoint counter range;
+# otherwise proposal and verification randomness overlap and the sampler is no
+# longer unbiased.
+_DRAFT_GUMBEL_POS_OFFSET = 1 << 30
+
+
+def draft_gumbel_pos(positions: torch.Tensor) -> torch.Tensor:
+    """Map target positions to a disjoint Philox range for draft sampling."""
+    return positions + _DRAFT_GUMBEL_POS_OFFSET
+
 
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
