@@ -8,6 +8,7 @@ import torch
 
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MegaMoEExperts,
+    DeepseekV4MoE,
     make_deepseek_v4_expert_params_mapping,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
@@ -30,6 +31,64 @@ def test_deepseek_v4_mega_moe_expert_mapping():
         ("experts.w2_", "experts.1.w2.", 1, "w2"),
         ("experts.w13_", "experts.1.w3.", 1, "w3"),
     ]
+
+
+def _sync_metadata(reported_ids: list[int], local_num_experts: int) -> SimpleNamespace:
+    expert_map_manager = SimpleNamespace(
+        global_num_experts=256,
+        local_num_experts=local_num_experts,
+        get_local_expert_ids=lambda: reported_ids,
+    )
+    moe = SimpleNamespace(
+        experts=SimpleNamespace(expert_map_manager=expert_map_manager)
+    )
+    DeepseekV4MoE._sync_fused_expert_metadata(moe)  # type: ignore[arg-type]
+    return moe
+
+
+@pytest.mark.parametrize(
+    ("local_expert_ids", "expected_bounds", "expected_contiguous"),
+    [
+        (list(range(256)), (0, 256), True),
+        (list(range(64, 128)), (64, 128), True),
+        (list(range(1, 256, 4)), (1, 254), False),
+    ],
+)
+def test_deepseek_v4_fused_moe_uses_expert_map_manager(
+    local_expert_ids: list[int],
+    expected_bounds: tuple[int, int],
+    expected_contiguous: bool,
+) -> None:
+    moe = _sync_metadata(local_expert_ids, len(local_expert_ids))
+
+    assert moe.local_expert_ids == tuple(local_expert_ids)
+    assert moe.n_local_experts == len(local_expert_ids)
+    assert moe.n_local_physical_experts == len(local_expert_ids)
+    assert (moe.experts_start_idx, moe.experts_end_idx) == expected_bounds
+    assert (moe.physical_expert_start, moe.physical_expert_end) == expected_bounds
+    assert moe.local_experts_contiguous is expected_contiguous
+
+
+def test_deepseek_v4_fused_moe_excludes_fused_shared_experts() -> None:
+    """Fused shared experts are appended past the routed range by the expert
+    map, and must not be counted as routed local experts."""
+    routed = list(range(64))
+    moe = _sync_metadata([*routed, 256], local_num_experts=len(routed))
+
+    assert moe.local_expert_ids == tuple(routed)
+    assert moe.n_local_experts == len(routed)
+    assert (moe.experts_start_idx, moe.experts_end_idx) == (0, 64)
+    assert moe.local_experts_contiguous is True
+
+
+def test_deepseek_v4_fused_moe_count_follows_reported_ids() -> None:
+    """The count comes from the id list, so a stale local_num_experts cannot
+    disagree with the experts actually owned by this rank."""
+    routed = list(range(32, 96))
+    moe = _sync_metadata(routed, local_num_experts=999)
+
+    assert moe.n_local_experts == len(routed)
+    assert moe.n_local_physical_experts == len(routed)
 
 
 def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
