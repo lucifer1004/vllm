@@ -52,6 +52,10 @@ def get_b12x_tensor_fp8_linear() -> ModuleType | None:
     return _get_submodule("b12x.gemm.tensor_fp8_linear")
 
 
+def get_b12x_paged_attention() -> ModuleType | None:
+    return _get_submodule("b12x.attention.paged")
+
+
 def b12x_warmup_token_counts(
     *,
     max_tokens: int,
