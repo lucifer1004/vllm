@@ -253,7 +253,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             self.intermediate_size_per_partition,
             self.max_num_tokens,
             self._activation_str,
-            torch.cuda.current_device(),
+            torch.accelerator.current_device_index(),
         )
         shared = FlashInferB12xExperts._shared_buffers.get(key)
         static_ws, dynamic_ws, output = shared if shared else (None, None, None)
