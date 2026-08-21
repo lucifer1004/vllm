@@ -58,6 +58,27 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_NVFP4_MLA_DYNAMIC_SCALE: bool = False
+    VLLM_NVFP4_MLA_SCALES_FILE: str = ""
+    VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE: bool = False
+    VLLM_USE_B12X_DCP_A2A: bool = False
+    VLLM_USE_B12X_SPARSE_INDEXER: bool = False
+    VLLM_DCP_A2A_MAX_TOKENS: int = 0
+    VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
+    VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
+    VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
+    VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
+    VLLM_DCP_GLOBAL_TOPK: bool = True
+    VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS: int = 0
+    VLLM_DCP_INDEXER_SHARDS: int = 0
+    VLLM_DCP_QUERY_SPLIT: bool = False
+    VLLM_B12X_MLA_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
+    VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
+    VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
+    VLLM_B12X_MLA_SPEC_DECODE_MAX_Q: int = 8
+    VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE: str = "auto"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -217,6 +238,17 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp", "flashinfer-ipc"] = "cpp"
+    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
+    VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
+    VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = False
+    VLLM_PCIE_DMA_FP8: str | None = None
+    VLLM_CPP_AR_1STAGE_NCCL_CUTOFF: str | None = None
+    VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS: int | None = None
+    VLLM_USE_B12X_PCIE_DMA: bool = False
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -262,6 +294,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
+    VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE: bool = False
+    VLLM_SYMM_MEM_PCIE_SAFE_BARRIER: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -309,6 +343,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
+    VLLM_MEMORY_PROFILE_INCLUDE_ATTN: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -1079,6 +1114,103 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    "VLLM_NVFP4_MLA_DYNAMIC_SCALE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0"))
+    ),
+    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv(
+        "VLLM_NVFP4_MLA_SCALES_FILE", ""
+    ).strip(),
+    # Reuse the B12X sparse-MLA query/scratch buffers for the guarded TP4/DCP4
+    # eager prefill path. The old name is retained for v1.3 compatibility.
+    "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE",
+                os.getenv("B12X_MLA_DCP_GATHER_IN_WORKSPACE", "0"),
+            )
+        )
+    ),
+    # Use b12x PCIe collectives for DCP query gather and output reduction.
+    "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
+    # Route the sparse-attention indexer top-k through the b12x paged indexer
+    # (SM120) instead of the DeepGEMM paged MQA logits + topk kernels.
+    "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
+    ),
+    # Token cap for the low-latency DCP A2A exchange (0 = uncapped). Batches
+    # with more tokens than this bypass the one-shot A2A/B12X path, which is
+    # latency-optimal for small decode batches but loses to pipelined NCCL
+    # collectives on large prefill/extend batches. Also bounds the B12X DCP
+    # IPC staging allocation, which scales linearly with this value.
+    "VLLM_DCP_A2A_MAX_TOKENS": lambda: int(os.getenv("VLLM_DCP_A2A_MAX_TOKENS", "0")),
+    # Collective pattern used for DCP batches above VLLM_DCP_A2A_MAX_TOKENS:
+    # "ag_rs" (default) routes them through the AllGather+ReduceScatter path;
+    # "a2a" keeps the NCCL all-to-all exchange (without B12X staging).
+    "VLLM_DCP_A2A_LARGE_BACKEND": lambda: os.getenv(
+        "VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs"
+    ),
+    # Project rank-local sparse MLA partials before their DCP merge. This is
+    # opt-in until the guarded TP4 path has been benchmarked against baseline.
+    "VLLM_DCP_PROJECT_BEFORE_MERGE": lambda: bool(
+        int(os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE", "0"))
+    ),
+    # Strict lower bound on actual prefill/extend rows. Keep it above every
+    # CUDA graph capture size so the weight gather remains eager-only.
+    "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS", "1024")
+    ),
+    # Replicate the target model's sparse-indexer K cache on every DCP rank.
+    "VLLM_DCP_REPLICATE_INDEXER_CACHE": lambda: (
+        os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # Number of unique sparse-indexer KV shards inside each configured DCP
+    # group. Zero keeps the configured DCP size; one fully replicates the
+    # cache. Intermediate divisors create replicated shard groups (for
+    # example, 4 under DCP8 creates two replicas of four shards).
+    "VLLM_DCP_INDEXER_SHARDS": lambda: int(os.getenv("VLLM_DCP_INDEXER_SHARDS", "0")),
+    # Under DCP, gather sparse-indexer logits across ranks and select a global
+    # top-k instead of a per-rank local top-k.
+    "VLLM_DCP_GLOBAL_TOPK": lambda: (
+        os.getenv("VLLM_DCP_GLOBAL_TOPK", "1").lower() in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DCP_QUERY_SPLIT": lambda: (
+        os.getenv("VLLM_DCP_QUERY_SPLIT", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    # Keep query-split process groups initialized while selecting the faster
+    # full-query path below a deployment-calibrated context crossover.
+    "VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "0")
+    ),
+    "VLLM_B12X_MLA_CKV_GATHER": lambda: (
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    "VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS", "16")
+    ),
+    "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # Number of future full-CKV layer gathers to queue. Zero keeps the
+    # synchronous gather path without allocating lookahead ring slots.
+    "VLLM_B12X_MLA_CKV_PREFETCH_DEPTH": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
+    ),
+    # Total per-lane CKV gather workspace budget, including the mandatory
+    # synchronous slot. Zero removes the cap. The requested prefetch depth is
+    # reduced automatically when its ring would exceed this budget.
+    "VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", "1024")
+    ),
+    # Short speculative extends may use the B12X sparse-MLA decode kernel.
+    # Backend validation remains authoritative because eligibility also
+    # depends on the active speculative configuration.
+    "VLLM_B12X_MLA_SPEC_DECODE_MAX_Q": lambda: int(
+        os.getenv("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", "8")
+    ),
+    "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE": lambda: os.getenv(
+        "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto"
+    ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by
@@ -1732,6 +1864,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "trtllm", "mnnvl"],
     ),
+    # Opt in to the b12x PCIe oneshot custom allreduce path on PCIe-only GPUs.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
+    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_PCIE_ALLREDUCE_BACKEND",
+        "cpp",
+        ["b12x", "cpp", "flashinfer-ipc"],
+    ),
+    # Max input size for the b12x PCIe oneshot allreduce dispatch.
+    # Accepts raw bytes or a KB/MB suffix (e.g. "84KB").
+    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
+    ),
+    # Max input size for the b12x PCIe fused allreduce+add_rms_norm dispatch.
+    "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
+    ),
+    # Minimum input size for uncompressed B12X DMA allreduce dispatch;
+    # defaults to 6 MiB. Accepts raw bytes or a case-insensitive KB/MB suffix.
+    # Whitespace is ignored. "off", "disabled", and "none" disable DMA.
+    # A deployment preflight may override this with a measured crossover.
+    "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
+    # Allow the b12x PCIe oneshot allreduce on cross-NUMA PCIe topologies.
+    "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA": lambda: (
+        os.getenv("VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1") != "0"
+    ),
+    # Reuse one b12x PCIe oneshot channel across CUDA streams. This saves
+    # buffers but is unsafe when target and draft graphs replay concurrently.
+    "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL": lambda: (
+        os.getenv("VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", "0").strip().lower()
+        not in ("", "0", "false", "no", "off")
+    ),
+    # Optional wire format and crossover tuning read by the custom-allreduce
+    # integration. Unset values delegate to backend-owned defaults.
+    "VLLM_PCIE_DMA_FP8": lambda: os.getenv("VLLM_PCIE_DMA_FP8"),
+    "VLLM_CPP_AR_1STAGE_NCCL_CUTOFF": lambda: os.getenv(
+        "VLLM_CPP_AR_1STAGE_NCCL_CUTOFF"
+    ),
+    "VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS": lambda: (
+        int(value)
+        if (value := os.getenv("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS")) is not None
+        else None
+    ),
+    # The DS4 launcher exports these for B12X and compiler-cache consumers.
+    # Register them so vLLM validation does not reject a supported launch.
+    "VLLM_USE_B12X_PCIE_DMA": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_PCIE_DMA", "0"))
+    ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
@@ -1863,6 +2044,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use FlashInfer allreduce
     "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "1"))
+    ),
+    # Allow the custom allreduce on >2 GPUs without full NVLink connectivity
+    # (PCIe-only P2P). The custom AR sync protocol is atomics-free (peer
+    # plain writes + local polling), so this is a performance opt-in, not a
+    # correctness risk; measure against NCCL on your topology first.
+    "VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE": lambda: bool(
+        int(os.getenv("VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE", "0"))
+    ),
+    # Replace the torch symm-mem group barrier with a stream-memops
+    # sequence protocol (peer plain writes + local waits). Needed for the
+    # pipelined fused GEMM+comm ops on platforms without native P2P
+    # atomics, where the stock CAS-based barrier wedges under load.
+    "VLLM_SYMM_MEM_PCIE_SAFE_BARRIER": lambda: bool(
+        int(os.getenv("VLLM_SYMM_MEM_PCIE_SAFE_BARRIER", "0"))
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
@@ -2092,6 +2287,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory allocation. Enabled by default as of v0.21.0
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))
+    ),
+    # Include backend-declared transient attention buffers in the profile peak.
+    "VLLM_MEMORY_PROFILE_INCLUDE_ATTN": lambda: bool(
+        int(os.getenv("VLLM_MEMORY_PROFILE_INCLUDE_ATTN", "0"))
     ),
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(

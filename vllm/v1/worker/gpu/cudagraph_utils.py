@@ -29,6 +29,7 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -303,11 +304,42 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def _prepare_pcie_allreduce_shapes(self) -> None:
+        """Pre-resolve PCIe all-reduce launch configs for every capture shape.
+
+        FlashInfer's IPC backend agrees on a shape's launch configuration
+        through a collective that cannot run inside a graph capture, so every
+        shape a graph may reference must be resolved here, after the capture
+        channel is bound but before any graph starts recording. The token
+        counts come from the shared compilation config, so every rank issues
+        the same list in the same order.
+        """
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            device_communicator = get_tp_group().device_communicator
+        except (AssertionError, RuntimeError):
+            return
+        ca_comm = getattr(device_communicator, "ca_comm", None)
+        prepare = getattr(ca_comm, "prepare_pcie_allreduce_shapes", None)
+        if prepare is None:
+            return
+        token_counts = sorted(
+            {
+                desc.num_tokens
+                for descs in self._capture_descs.values()
+                for desc in descs
+            }
+        )
+        prepare(token_counts)
+
     @torch.inference_mode()
     def capture(
         self,
         create_forward_fn: CreateForwardFn,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        *,
+        channel_id: str | None = None,
     ) -> None:
         """Capture CUDA graphs.
 
@@ -317,8 +349,13 @@ class CudaGraphManager:
                 it is invoked once with warmup=True and again with warmup=False
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
+            channel_id: Stable distributed identity for this graph owner.
         """
-        with graph_capture(device=self.device):
+        with (
+            graph_capture(device=self.device, channel_id=channel_id),
+            vllm_cudagraph_capture_scope(),
+        ):
+            self._prepare_pcie_allreduce_shapes()
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -362,7 +399,10 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        with torch.cuda.graph(graph, self.pool):
+                        with (
+                            vllm_cudagraph_capture_scope(),
+                            torch.cuda.graph(graph, self.pool),
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
@@ -476,6 +516,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        *,
+        channel_id: str | None = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -585,7 +627,7 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(create_forward_fn, progress_bar_desc, channel_id=channel_id)
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

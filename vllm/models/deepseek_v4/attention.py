@@ -6,6 +6,7 @@ DeepseekV4 MLA Attention Layer
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -48,7 +49,9 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import (
+    CUDAGraphCaptureEventPool,
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
@@ -141,6 +144,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
     # a single attention class dispatches across arch-specific layouts.
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # Backends whose sparse-indexer auxiliary branch contains a long host-side
+    # launch loop can enqueue the independent default-stream Q branch first.
+    # The stream/event dependency graph remains identical.
+    enqueue_default_before_indexer: ClassVar[bool] = False
+    # Some custom attention kernels are captured as part of a larger FULL graph
+    # and cannot safely replay the C4 post-GEMM work from auxiliary streams.
+    enable_post_gemm_aux_streams: ClassVar[bool] = True
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
@@ -178,14 +188,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """Return whether this instance stores fp8 KV in fp8_ds_mla layout."""
         return self.use_fp8_ds_mla_layout
 
+    def _post_gemm_aux_stream(self, index: int) -> torch.cuda.Stream | None:
+        if not self.enable_post_gemm_aux_streams or self.aux_stream_list is None:
+            return None
+        return self.aux_stream_list[index]
+
+    def _post_gemm_event_lease(
+        self,
+    ) -> AbstractContextManager[list[torch.cuda.Event]]:
+        pool = getattr(self, "attn_event_pool", None)
+        # attention_impl can execute eagerly between CUDA graph segments. Its
+        # event handles must not be recycled into another graph artifact.
+        if pool is None:
+            return nullcontext(self.attn_events)
+        return pool.lease(private_eager=True)
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
+        self.vllm_config = vllm_config
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
@@ -210,6 +237,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # in the compress ratio list
         if layer_id < config.num_hidden_layers:
             self.compress_ratio = max(1, config.compress_ratios[layer_id])
+        elif layer_id < len(config.compress_ratios):
+            self.compress_ratio = config.compress_ratios[layer_id]
         else:
             self.compress_ratio = 1
         self.eps = config.rms_norm_eps
@@ -273,15 +302,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
 
+        # Will be None on ROCm for now.
+        self.aux_stream_list = aux_stream_list
+
         self.indexer = None
         if self.compress_ratio == 4:
             # Only C4A uses sparse attention and hence has indexer.
             # aux_stream_list[2] is free here (outer GEMMs joined) for the inner
             # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on
             # ROCm, where aux_stream_list is None.
-            indexer_aux_stream = (
-                aux_stream_list[2] if aux_stream_list is not None else None
-            )
+            indexer_aux_stream = self._post_gemm_aux_stream(2)
             self.indexer = DeepseekV4Indexer(
                 vllm_config,
                 config=config,
@@ -293,6 +323,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
+                topk_scores_buffer=topk_scores_buffer,
             )
 
         self._prepare_and_attn_fn = self._prepare_and_attn
@@ -302,12 +333,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # graph and MRV1 produces garbage (#51430).
             self._prepare_and_attn_fn = self._prepare_and_attn_eager
 
-        # Will be None on ROCm for now.
-        self.aux_stream_list = aux_stream_list
-        # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
-        # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
-        # before post-GEMM starts.
+        # [0]: GEMM start event. [1..3]: GEMM done events. Post-GEMM
+        # (indexer/compressor) overlap events come from attn_event_pool
+        # instead: the generations stay independent, since the first join only
+        # enqueues waits on the default stream and re-recording those events
+        # for cache/indexer overlap before the waits execute can race.
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
+        self.attn_event_pool = CUDAGraphCaptureEventPool(3)
+        self.attn_events = self.attn_event_pool.default_events
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
@@ -458,34 +491,41 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # indexer. ROCm runs the same work sequentially without aux streams.
         if indexer is not None:
             assert compressor is not None
-            q, (indexer_inputs, _) = execute_in_parallel(
-                project_query_and_cache_kv,
-                [
-                    lambda: indexer(
-                        hidden_states,
-                        qr,
-                        indexer_kv_score,
-                        indexer_weights,
-                        positions,
-                        self.indexer_rotary_emb,
+            with self._post_gemm_event_lease() as attn_events:
+                q, (indexer_inputs, _) = execute_in_parallel(
+                    project_query_and_cache_kv,
+                    [
+                        lambda: indexer(
+                            hidden_states,
+                            qr,
+                            indexer_kv_score,
+                            indexer_weights,
+                            positions,
+                            self.indexer_rotary_emb,
+                        ),
+                        lambda: compressor(kv_score, positions, self.rotary_emb),
+                    ],
+                    attn_events[0],
+                    [attn_events[1], attn_events[2]],
+                    [aux_streams[0], aux_streams[1]]
+                    if aux_streams is not None
+                    else None,
+                    enable=(
+                        aux_streams is not None and self.enable_post_gemm_aux_streams
                     ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
-                ],
-                self.ln_events[0],
-                [self.ln_events[1], self.ln_events[2]],
-                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
-            )
+                    enqueue_default_first=self.enqueue_default_before_indexer,
+                )
             index_q, index_q_scale, index_weights_out = indexer_inputs
         elif compressor is not None:
-            aux_stream = aux_streams[0] if aux_streams is not None else None
-            q, _ = maybe_execute_in_parallel(
-                project_query_and_cache_kv,
-                lambda: compressor(kv_score, positions, self.rotary_emb),
-                self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
-            )
+            aux_stream = self._post_gemm_aux_stream(0)
+            with self._post_gemm_event_lease() as attn_events:
+                q, _ = maybe_execute_in_parallel(
+                    project_query_and_cache_kv,
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    attn_events[0],
+                    attn_events[1],
+                    aux_stream,
+                )
         else:
             q = project_query_and_cache_kv()
 
@@ -766,6 +806,7 @@ class DeepseekV4Indexer(nn.Module):
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -805,13 +846,19 @@ class DeepseekV4Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
-        self.max_model_len = (
-            vllm_config.model_config.max_model_len // self.compress_ratio
+        cp_size = (
+            vllm_config.parallel_config.prefill_context_parallel_size
+            * vllm_config.parallel_config.decode_context_parallel_size
+        )
+        self.max_model_len = cdiv(
+            vllm_config.model_config.max_model_len,
+            self.compress_ratio * cp_size,
         )
         self.prefix = prefix
 
-        self.max_total_seq_len = (
-            get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
+        self.max_total_seq_len = cdiv(
+            get_max_prefill_buffer_size(vllm_config),
+            self.compress_ratio * cp_size,
         )
 
         assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
@@ -854,14 +901,13 @@ class DeepseekV4Indexer(nn.Module):
             self.topk_indices_buffer,
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
+            topk_scores_buffer=topk_scores_buffer,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
         self.aux_stream = aux_stream
-        self.ln_events: list[torch.cuda.Event] = [
-            torch.cuda.Event(),
-            torch.cuda.Event(),
-        ]
+        self.event_pool = CUDAGraphCaptureEventPool(2)
+        self.ln_events = self.event_pool.default_events
 
     def forward(
         self,
@@ -916,13 +962,14 @@ class DeepseekV4Indexer(nn.Module):
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).
-        (q_quant, weights), _ = maybe_execute_in_parallel(
-            wq_b_and_q_quant,
-            lambda: compressor(compressed_kv_score, positions, rotary_emb),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        with self.event_pool.lease(private_eager=True) as events:
+            (q_quant, weights), _ = maybe_execute_in_parallel(
+                wq_b_and_q_quant,
+                lambda: compressor(compressed_kv_score, positions, rotary_emb),
+                events[0],
+                events[1],
+                self.aux_stream,
+            )
         if isinstance(q_quant, tuple):
             q, q_scale = q_quant
         else:

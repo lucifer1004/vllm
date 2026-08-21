@@ -95,6 +95,84 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
     )
 
 
+def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
+    if not envs.VLLM_USE_B12X_DCP_A2A:
+        return 0
+    parallel_config = getattr(worker.vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        return 0
+    dcp_world_size = parallel_config.decode_context_parallel_size
+    if dcp_world_size <= 1 or parallel_config.dcp_comm_backend != "a2a":
+        return 0
+
+    from vllm.distributed.parallel_state import get_dcp_group
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.v1.attention.ops.dcp import warmup_b12x_dcp_a2a
+
+    b12x_mla_attention_cls: type | None
+    try:
+        from vllm.models.deepseek_v4.nvidia.b12x import (
+            DeepseekV4B12xMLAAttention,
+        )
+
+        b12x_mla_attention_cls = DeepseekV4B12xMLAAttention
+    except ImportError:
+        # The b12x DSv4 attention wrapper ships with the mHC port; warm only
+        # stock MLAAttention layers until it lands.
+        b12x_mla_attention_cls = None
+
+    model = worker.get_model()
+    candidates = list(model.modules())
+    candidates.extend(
+        worker.vllm_config.compilation_config.static_forward_context.values()
+    )
+    seen_modules: set[int] = set()
+    warmed_signatures: set[tuple[torch.device, torch.dtype, int, int, int]] = set()
+    for module in candidates:
+        if id(module) in seen_modules:
+            continue
+        seen_modules.add(id(module))
+
+        dtype = worker.model_config.dtype
+        if b12x_mla_attention_cls is not None and isinstance(
+            module, b12x_mla_attention_cls
+        ):
+            device = module.attn_sink.device
+            total_heads = int(module.n_local_heads) * dcp_world_size
+            query_head_dim = int(module.head_dim)
+            output_head_dim = int(module.head_dim)
+        elif isinstance(module, MLAAttention) and module.dcp_b12x:
+            device = next(module.parameters()).device
+            total_heads = int(module.num_heads) * dcp_world_size
+            query_head_dim = int(module.kv_lora_rank + module.qk_rope_head_dim)
+            output_head_dim = int(module.kv_lora_rank)
+        else:
+            continue
+
+        signature = (
+            device,
+            dtype,
+            total_heads,
+            query_head_dim,
+            output_head_dim,
+        )
+        if signature in warmed_signatures:
+            continue
+
+        warmup_b12x_dcp_a2a(
+            get_dcp_group(),
+            device=device,
+            dtype=dtype,
+            max_batch_size=worker.scheduler_config.max_num_batched_tokens,
+            total_heads=total_heads,
+            head_dim=output_head_dim,
+            query_head_dim=query_head_dim,
+        )
+        warmed_signatures.add(signature)
+
+    return len(warmed_signatures)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -136,6 +214,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
         cudagraph_capture_sizes=cudagraph_capture_sizes,
     )
+
+    warmed_dcp_a2a = _warmup_b12x_dcp_a2a(worker)
+    if warmed_dcp_a2a:
+        logger.info(
+            "Warmed up %d B12X DCP collective signature(s).",
+            warmed_dcp_a2a,
+        )
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if worker.vllm_config.kernel_config.enable_jit_warmup:

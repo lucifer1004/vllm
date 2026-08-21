@@ -889,10 +889,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     has_lora=self.lora_config is not None,
                     use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                     lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                    channel_id="vllm:target:production",
                 )
                 if self.speculator is not None:
                     with use_workspace_lane(self._draft_workspace_lane):
-                        self.speculator.capture()
+                        self.speculator.capture(capture_phase="production")
                 if self.adaptive_verification is not None:
                     with self.step_timing.collect() as timings:
                         for batch in self.adaptive_verification.batches_to_profile(

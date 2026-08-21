@@ -82,6 +82,31 @@ def _uses_v2_model_runner(runner: "GPUModelRunner") -> bool:
     return bool(getattr(vllm_config, "use_v2_model_runner", False))
 
 
+def _warmup_deepseek_v4_prefill_metadata(worker: "Worker") -> None:
+    if not current_platform.is_cuda():
+        return
+
+    runner = worker.model_runner
+    hf_config = getattr(runner.model_config, "hf_config", None)
+    window_size = int(getattr(hf_config, "sliding_window", 4096) or 4096)
+    max_num_prefills = int(worker.scheduler_config.max_num_seqs)
+
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        warmup_deepseek_v4_prefill_metadata_kernel,
+    )
+
+    launches = warmup_deepseek_v4_prefill_metadata_kernel(
+        runner.device,
+        max_num_prefills=max_num_prefills,
+        window_size=window_size,
+    )
+    if launches:
+        logger.info(
+            "Warmed up DeepSeek V4 prefill metadata kernel with %d launches.",
+            launches,
+        )
+
+
 def _run_flashinfer_sparse_mla_decode_autotune(
     worker: "Worker",
     num_tokens: int,
@@ -127,7 +152,16 @@ def _run_flashinfer_sparse_mla_decode_autotune(
             cache_path,
         )
 
-    with torch.inference_mode():
+    from vllm.distributed.device_communicators.custom_all_reduce import (
+        suppress_flashinfer_ipc_allreduce,
+    )
+
+    # The leader profiles inside an autotune context while followers run the
+    # same dummy batch outside it. A first-time FlashInfer IPC launch-config
+    # resolution on a follower would issue its collective agreement against
+    # the leader's profiling loop and deadlock the TP group, so every rank
+    # keeps the flashinfer-ipc PCIe backend on NCCL for this warmup scope.
+    with torch.inference_mode(), suppress_flashinfer_ipc_allreduce():
         warmup_executed = True
         if is_leader:
             if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
@@ -234,6 +268,7 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
         "Warming up DeepSeek V4 sparse MLA attention for mixed tokens=%s.",
         mixed_tokens,
     )
+    _warmup_deepseek_v4_prefill_metadata(worker)
     mixed_warmup_done = _deepseek_v4_sparse_mla_decode_autotune(worker, mixed_tokens)
     if not mixed_warmup_done:
         if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:

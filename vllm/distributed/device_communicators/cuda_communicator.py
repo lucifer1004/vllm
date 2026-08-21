@@ -71,6 +71,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
 
+        if envs.VLLM_SYMM_MEM_PCIE_SAFE_BARRIER:
+            from vllm.distributed.device_communicators.symm_mem_pcie_barrier import (
+                install_pcie_safe_barrier,
+            )
+
+            install_pcie_safe_barrier()
+
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
@@ -125,6 +132,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
+                nccl_group=self.device_group,
             )
 
         if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
@@ -260,7 +268,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.aiter_ar_comm is not None and not self.aiter_ar_comm.disabled:
             enabled_ar_backends.append("AITER_CUSTOM")
         if self.ca_comm is not None and not self.ca_comm.disabled:
-            enabled_ar_backends.append("CUSTOM")
+            enabled_ar_backends.append(self.ca_comm.backend_name())
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
             enabled_ar_backends.append("SYMM_MEM")
         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
@@ -418,6 +426,104 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
+    def reduce_scatter_into(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Run eager DCP reduce-scatter without allocating."""
+        if self.world_size <= 1 or dim != 1:
+            raise RuntimeError("reduce_scatter_into requires DCP heads on dim 1")
+        if input_.ndim != 3 or output.ndim != 3:
+            raise ValueError("reduce_scatter_into requires rank-3 tensors")
+        num_tokens = int(input_.shape[0])
+        input_heads = int(input_.shape[1])
+        if input_heads % self.world_size != 0:
+            raise ValueError("reduce_scatter_into head count is not DCP-divisible")
+        output_heads = input_heads // self.world_size
+        expected_input = (num_tokens, input_heads, 256)
+        expected_output = (num_tokens, output_heads, 256)
+        if (
+            num_tokens < 1025
+            or tuple(input_.shape) != expected_input
+            or tuple(output.shape) != expected_output
+            or input_.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or input_.device != output.device
+            or input_.device != self.device
+        ):
+            raise ValueError(
+                "reduce_scatter_into requires DCP-divisible BF16 "
+                "[T,H,256] -> [T,H/DCP,256] on the communicator device"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("reduce_scatter_into is eager-only")
+
+        input_tensor = input_.movedim(0, dim)
+        output_tensor = output.movedim(0, dim)
+        if not input_tensor.is_contiguous() or not output_tensor.is_contiguous():
+            raise ValueError("reduce_scatter_into requires head-major storage")
+        if input_tensor.numel() != self.world_size * output_tensor.numel():
+            raise ValueError("reduce_scatter_into element-count mismatch")
+
+        input_begin = input_tensor.data_ptr()
+        input_end = input_begin + input_tensor.numel() * input_tensor.element_size()
+        output_begin = output_tensor.data_ptr()
+        output_end = output_begin + output_tensor.numel() * output_tensor.element_size()
+        if input_begin < output_end and output_begin < input_end:
+            raise ValueError("reduce_scatter_into input and output overlap")
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            raise RuntimeError("reduce_scatter_into requires PyNccl")
+        pynccl_comm.reduce_scatter(
+            output_tensor,
+            input_tensor,
+            stream=torch.cuda.current_stream(self.device),
+        )
+        return output
+
+    def reduce_scatter_head_major(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Reduce-scatter heads without the final token-major copy."""
+        if self.world_size <= 1:
+            raise RuntimeError("head-major reduce-scatter requires world size > 1")
+        if dim < 0:
+            dim += input_.dim()
+        if dim != 1 or input_.ndim != 3:
+            raise ValueError(
+                "head-major reduce-scatter requires a rank-3 tensor on dim 1"
+            )
+
+        input_head_major = input_.movedim(0, dim).contiguous()
+        if input_head_major.shape[0] % self.world_size != 0:
+            raise ValueError("head count is not divisible by world size")
+        output_shape = (
+            input_head_major.shape[0] // self.world_size,
+            *input_head_major.shape[1:],
+        )
+
+        if should_nccl_symm_mem_ag_rs():
+            output_head_major = self._reduce_scatter_symm_mem(input_head_major)
+        else:
+            output_head_major = torch.empty(
+                output_shape,
+                dtype=input_head_major.dtype,
+                device=input_head_major.device,
+            )
+            pynccl_comm = self.pynccl_comm
+            if pynccl_comm is None or pynccl_comm.disabled:
+                raise RuntimeError(
+                    "head-major reduce-scatter requires an active PyNccl communicator"
+                )
+            pynccl_comm.reduce_scatter(output_head_major, input_head_major)
+
+        return output_head_major.movedim(0, dim)
+
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
@@ -573,11 +679,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        if self.ca_comm is not None:
+            # B12X close is coordinated across ranks and must run before
+            # its NCCL exchange group is destroyed.
+            self.ca_comm.close()
+            self.ca_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.aiter_ar_comm is not None:
             self.aiter_ar_comm.close()
             self.aiter_ar_comm = None

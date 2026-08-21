@@ -45,11 +45,13 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     GraphCaptureContext,
+    checkpoint_b12x_graph_channels,
     get_dcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
     is_global_first_rank,
+    rollback_b12x_graph_channels,
 )
 from vllm.forward_context import (
     BatchDescriptor,
@@ -139,6 +141,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionType,
+    CommonAttentionBatchTopology,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -2517,6 +2520,14 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            batch_topology=CommonAttentionBatchTopology(
+                query_start_loc_np=self.query_start_loc.cpu[
+                    : num_reqs_padded + 1
+                ].numpy(),
+                num_reqs=num_reqs_padded,
+                max_query_len=max_query_len,
+                max_seq_len_upper_bound=max_seq_len,
+            ),
         )
 
         if self.dcp_world_size > 1:
@@ -6844,11 +6855,20 @@ class GPUModelRunner(
 
         # Cleanup-only guard: CUDA graph capture errors should still propagate
         # because encoder graph capture is opt-in.
+        # Snapshot graph-owned B12X channels before this profiling capture so
+        # profiling cannot leave stale channels behind.
+        graph_channel_checkpoints: tuple[tuple[Callable[[Any], None], Any], ...] = (
+            checkpoint_b12x_graph_channels()
+        )
         try:
             set_cudagraph_capturing_enabled(True)
             with (
                 self._freeze_gc(),
-                graph_capture(device=self.device, graph_capture_context=cap_ctx),
+                graph_capture(
+                    device=self.device,
+                    graph_capture_context=cap_ctx,
+                    channel_id="vllm:target:profile",
+                ),
             ):
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()
@@ -6909,6 +6929,7 @@ class GPUModelRunner(
             set_cudagraph_capturing_enabled(False)
             CUDAGraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
+            rollback_b12x_graph_channels(graph_channel_checkpoints)
             if encoder_cudagraph_manager is not None:
                 encoder_cudagraph_manager.clear()
             all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
@@ -6998,7 +7019,10 @@ class GPUModelRunner(
                 "Rank %d: Torch profiler disabled for CUDA graph capture", local_rank
             )
 
-        with self._freeze_gc(), graph_capture(device=self.device):
+        with (
+            self._freeze_gc(),
+            graph_capture(device=self.device, channel_id="vllm:target:production"),
+        ):
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]

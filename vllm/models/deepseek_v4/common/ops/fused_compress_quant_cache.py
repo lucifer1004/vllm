@@ -58,6 +58,9 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -111,6 +114,9 @@ def compress_norm_rope_store_triton(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_RANK=dcp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
         num_warps=num_warps,
         **kernel_kwargs,
         **pdl_kwargs,
@@ -156,6 +162,9 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -183,13 +192,28 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     pos = start + tokens
     mask_pos = pos >= 0
 
-    block_indices = pos // block_size
+    if DCP_WORLD_SIZE == 1:
+        block_indices = pos // block_size
+        block_offsets = pos % block_size
+        local_pos_mask = mask_pos
+    else:
+        virtual_block_size = block_size * DCP_WORLD_SIZE
+        block_indices = pos // virtual_block_size
+        virtual_block_offsets = pos - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % DCP_WORLD_SIZE == DCP_RANK
+        block_offsets = (
+            virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+        local_pos_mask = mask_pos & is_local
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=local_pos_mask,
         other=0,
     )
-    block_offsets = pos % block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
 
     block = tl.arange(0, TRITON_BLOCK_SIZE)
@@ -204,7 +228,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
+    combined_mask = local_pos_mask[:, None] & mask[None, :]
 
     # ── Softmax + weighted sum ───────────────────────────────────────
     score = tl.load(
@@ -708,6 +732,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -739,13 +766,28 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     pos = start + tokens
     mask_pos = pos >= 0
 
-    block_indices = pos // block_size
+    if DCP_WORLD_SIZE == 1:
+        block_indices = pos // block_size
+        block_offsets = pos % block_size
+        local_pos_mask = mask_pos
+    else:
+        virtual_block_size = block_size * DCP_WORLD_SIZE
+        block_indices = pos // virtual_block_size
+        virtual_block_offsets = pos - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % DCP_WORLD_SIZE == DCP_RANK
+        block_offsets = (
+            virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+        local_pos_mask = mask_pos & is_local
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=local_pos_mask,
         other=0,
     )
-    block_offsets = pos % block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
 
     block = tl.arange(0, TRITON_BLOCK_SIZE)
@@ -759,7 +801,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
+    combined_mask = local_pos_mask[:, None] & mask[None, :]
 
     score = tl.load(
         row_base[:, None] + STATE_WIDTH + block[None, :],
@@ -885,6 +927,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
 
@@ -918,13 +963,28 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     pos = start + tokens
     mask_pos = pos >= 0
 
-    block_indices = pos // block_size
+    if DCP_WORLD_SIZE == 1:
+        block_indices = pos // block_size
+        block_offsets = pos % block_size
+        local_pos_mask = mask_pos
+    else:
+        virtual_block_size = block_size * DCP_WORLD_SIZE
+        block_indices = pos // virtual_block_size
+        virtual_block_offsets = pos - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % DCP_WORLD_SIZE == DCP_RANK
+        block_offsets = (
+            virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+        local_pos_mask = mask_pos & is_local
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
+        mask=local_pos_mask,
         other=0,
     )
-    block_offsets = pos % block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
 
     block = tl.arange(0, TRITON_BLOCK_SIZE)
@@ -938,7 +998,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
         + head_offset
     )
 
-    combined_mask = mask_pos[:, None] & mask[None, :]
+    combined_mask = local_pos_mask[:, None] & mask[None, :]
 
     score = tl.load(
         row_base[:, None] + STATE_WIDTH + block[None, :],
