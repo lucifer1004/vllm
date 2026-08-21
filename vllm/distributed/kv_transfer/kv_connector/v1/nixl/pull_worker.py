@@ -186,6 +186,34 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_size,
                 req_id,
             )
+            packed_pp_handles = self._packed_pp_pull_dst_handles.get(engine_id, {})
+            if packed_pp_handles:
+                stage_keys = sorted(
+                    key for key in packed_pp_handles if key[1] == spec.remote_rank
+                )
+                if len(stage_keys) != meta.pp_size:
+                    raise RuntimeError(
+                        "Incomplete packed PP NIXL handshake: expected "
+                        f"{meta.pp_size} stages for TP rank {spec.remote_rank}, "
+                        f"got {len(stage_keys)}."
+                    )
+                for stage_key in stage_keys:
+                    self._read_blocks(
+                        read_spec=spec,
+                        request_id=req_id,
+                        dst_engine_id=meta.remote.engine_id,
+                        remote_request_id=meta.remote.request_id,
+                        local_xfer_side_handle=(
+                            self._packed_pp_pull_src_handles[engine_id][stage_key]
+                        ),
+                        remote_xfer_side_handle=packed_pp_handles[stage_key],
+                        remote_pp_rank=stage_key[0],
+                        packed_region_indices_by_group=(
+                            self._packed_pp_pull_region_indices[engine_id][stage_key]
+                        ),
+                    )
+                continue
+
             # Get side handles.
             if tp_ratio < 0 and (not self.use_mla or len(read_specs) > 1):
                 # Remote tp_size > local tp_size: we must perform multiple
@@ -230,6 +258,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        remote_pp_rank: int = 0,
+        packed_region_indices_by_group: list[list[int]] | None = None,
     ):
         """
         Post a READ point-to-point xfer request from a single local worker to
@@ -267,7 +297,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # just notify P worker that we have the blocks we need.
         if len(local_block_ids) == 0:
             # A full prefix cache hit is indicated with an empty list.
-            agent_name = self._remote_agents[dst_engine_id][(0, remote_rank)]
+            agent_name = self._remote_agents[dst_engine_id][
+                (remote_pp_rank, remote_rank)
+            ]
             try:
                 self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
             except Exception as e:
@@ -301,18 +333,35 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # workers will issue xfers to parts of the P worker remote kv caches.
 
         # Get descs ids.
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-        )
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-        )
+        if packed_region_indices_by_group is not None:
+            assert block_size_ratio == 1
+            remote_block_descs_ids = self._compute_packed_desc_ids(
+                remote_block_ids,
+                self.dst_num_blocks[dst_engine_id],
+                packed_region_indices_by_group,
+            )
+            local_block_descs_ids = self._compute_packed_desc_ids(
+                local_block_ids,
+                self.dst_num_blocks[self.engine_id],
+                packed_region_indices_by_group,
+            )
+        else:
+            remote_block_descs_ids = self._compute_desc_ids(
+                block_ids=remote_block_ids,
+                dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+                block_size_ratio=None,
+                physical_blocks_per_logical=(
+                    remote_info.remote_physical_blocks_per_logical
+                ),
+            )
+            local_block_descs_ids = self._compute_desc_ids(
+                block_ids=local_block_ids,
+                dst_num_blocks=self.dst_num_blocks[self.engine_id],
+                block_size_ratio=block_size_ratio,
+                physical_blocks_per_logical=(
+                    self._physical_blocks_per_logical_kv_block
+                ),
+            )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 

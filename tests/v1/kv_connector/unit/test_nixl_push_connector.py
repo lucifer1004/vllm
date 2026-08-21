@@ -30,12 +30,18 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import msgspec
+import numpy as np
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
     NixlConnectorMetadata,
+    NixlPackedKVRegion,
+    compute_nixl_compatibility_hash,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
+    NixlPullConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
@@ -46,7 +52,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import KVConnectorOutput
 
-from .utils import make_nixl_push_scheduler
+from .utils import create_vllm_config, make_nixl_push_scheduler
+
+
+def test_compatibility_hash_ignores_attention_backend_discovery_order():
+    config = create_vllm_config()
+    stage_zero_backends = ["FLASHINFER_MLA", "INDEXER", "COMPRESSOR"]
+    stage_one_backends = ["COMPRESSOR", "FLASHINFER_MLA", "INDEXER"]
+
+    assert compute_nixl_compatibility_hash(
+        config, stage_zero_backends, False
+    ) == compute_nixl_compatibility_hash(config, stage_one_backends, False)
+
 
 # ----------------------------------------------------------------- #
 #  Helpers / fakes                                                   #
@@ -1075,6 +1092,195 @@ class TestPushPipelineParallel:
         # Sliced down to this worker's layer window (regions [2:4]).
         assert meta.kv_caches_base_addr == [12, 13]
         assert meta.block_lens == [block_len, block_len]
+
+    def test_packed_descriptor_ids_are_scoped_by_kv_group(self):
+        """Packed PP transfers only the local layer segments owned by each
+        request block's KV group."""
+        w = _StubWriterWorker.fresh()
+        w._use_packed_pp_descriptors = True
+        w._packed_region_indices_by_group = [[0, 1], [2]]
+
+        desc_ids = w._compute_desc_ids(
+            block_ids=([1, 3], [4]),
+            dst_num_blocks=8,
+            block_size_ratio=None,
+            physical_blocks_per_logical=1,
+        )
+
+        np.testing.assert_array_equal(desc_ids, [1, 3, 9, 11, 20])
+
+    def test_packed_remote_descriptors_match_layers_not_local_offsets(self):
+        """A compact PP-stage slab lands at the corresponding named offsets
+        inside the decode worker's full-model packed block."""
+        w = _StubWriterWorker.fresh()
+        w._packed_kv_cache_regions = [
+            NixlPackedKVRegion(0, "target.layer.8", 0, 16),
+            NixlPackedKVRegion(1, "draft.layer.0", 16, 8),
+        ]
+        remote = NixlAgentMetadata(
+            engine_id="decode",
+            agent_metadata=b"agent",
+            kv_caches_base_addr=[1000],
+            device_id=3,
+            num_blocks=2,
+            block_lens=[100],
+            kv_cache_layout="HND",
+            block_size=16,
+            ssm_sizes=(0, 0),
+            attn_backend_name="FLASHINFER_MLA_SPARSE_DSV4",
+            physical_blocks_per_logical_kv_block=1,
+            packed_kv_cache_regions=[
+                NixlPackedKVRegion(0, "target.layer.8", 40, 16),
+                NixlPackedKVRegion(1, "draft.layer.0", 72, 8),
+            ],
+            packed_kv_cache_block_stride=100,
+        )
+
+        descriptors = w._build_packed_remote(remote)
+
+        np.testing.assert_array_equal(
+            descriptors,
+            [
+                [1040, 16, 3],
+                [1140, 16, 3],
+                [1072, 8, 3],
+                [1172, 8, 3],
+            ],
+        )
+
+
+class TestPullPipelineParallel:
+    def test_prepares_stage_descriptors_by_layer_name(self):
+        """The remote compact stage slab maps into matching named offsets in
+        the decode worker's full-model slab."""
+        worker = object.__new__(NixlPullConnectorWorker)
+        worker.engine_id = "decode-engine"
+        worker.tp_rank = 0
+        worker.block_size = 16
+        worker.num_blocks = 2
+        worker.device_id = 4
+        worker.nixl_memory_type = "VRAM"
+        worker._packed_kv_cache_block_stride = 100
+        worker._packed_kv_cache_regions = [
+            NixlPackedKVRegion(0, "target.layer.0", 0, 16),
+            NixlPackedKVRegion(0, "target.layer.1", 40, 16),
+            NixlPackedKVRegion(1, "draft.layer.0", 72, 8),
+        ]
+        worker.kv_caches_base_addr = {worker.engine_id: {worker.tp_rank: [1000]}}
+        worker.kv_cache_config = MagicMock(kv_cache_groups=[MagicMock(), MagicMock()])
+        worker._packed_pp_pull_src_handles = defaultdict(dict)
+        worker._packed_pp_pull_dst_handles = defaultdict(dict)
+        worker._packed_pp_pull_region_indices = defaultdict(dict)
+        worker.nixl_wrapper = MagicMock()
+        worker.nixl_wrapper.get_xfer_descs.side_effect = lambda data, _: data
+        worker.nixl_wrapper.prep_xfer_dlist.side_effect = [10, 20]
+
+        remote = NixlAgentMetadata(
+            engine_id="prefill-engine",
+            agent_metadata=b"agent",
+            kv_caches_base_addr=[2000],
+            device_id=2,
+            num_blocks=2,
+            block_lens=[40],
+            kv_cache_layout="HND",
+            block_size=16,
+            ssm_sizes=(0, 0),
+            attn_backend_name="FLASHINFER_MLA_SPARSE_DSV4",
+            physical_blocks_per_logical_kv_block=1,
+            packed_kv_cache_regions=[
+                NixlPackedKVRegion(0, "target.layer.1", 0, 16),
+                NixlPackedKVRegion(1, "draft.layer.0", 16, 8),
+            ],
+            packed_kv_cache_block_stride=40,
+        )
+
+        worker._prepare_packed_pp_pull_handles(remote, "remote-agent", 1, 0)
+
+        local_data = worker.nixl_wrapper.get_xfer_descs.call_args_list[0].args[0]
+        remote_data = worker.nixl_wrapper.get_xfer_descs.call_args_list[1].args[0]
+        np.testing.assert_array_equal(
+            local_data,
+            [[1040, 16, 4], [1140, 16, 4], [1072, 8, 4], [1172, 8, 4]],
+        )
+        np.testing.assert_array_equal(
+            remote_data,
+            [[2000, 16, 2], [2040, 16, 2], [2016, 8, 2], [2056, 8, 2]],
+        )
+        key = (1, 0)
+        assert worker._packed_pp_pull_src_handles[remote.engine_id][key] == 10
+        assert worker._packed_pp_pull_dst_handles[remote.engine_id][key] == 20
+        assert worker._packed_pp_pull_region_indices[remote.engine_id][key] == [
+            [0],
+            [1],
+        ]
+
+    def test_one_read_is_issued_per_remote_pp_stage(self):
+        """A PP-sharded producer requires one READ per stage so the decode
+        worker receives every named layer segment."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+            RemoteMeta,
+            ReqMeta,
+        )
+
+        worker = object.__new__(NixlPullConnectorWorker)
+        engine_id = "prefill-engine"
+        worker.engine_id = "decode-engine"
+        worker._engine_last_active = {}
+        worker._bidirectional_kv_xfer_enabled = False
+        worker._physical_blocks_per_logical_kv_block = 1
+        worker.use_mla = True
+        worker._has_mamba = False
+        worker.world_size = 4
+        worker.transfer_topo = MagicMock()
+        worker.transfer_topo.get_engine_info.return_value = MagicMock(
+            remote_tp_size=2,
+            remote_block_size=256,
+            remote_physical_blocks_per_logical=1,
+        )
+        worker.transfer_topo.tp_ratio.return_value = 2
+        worker.tp_mappings = {
+            engine_id: MagicMock(
+                source_ranks_per_group=[[0], [0]],
+                all_source_ranks=[0],
+            )
+        }
+        worker._logical_to_kernel_block_ids = lambda blocks, ratio: blocks
+        worker._packed_pp_pull_src_handles = {engine_id: {(0, 0): 10, (1, 0): 11}}
+        worker._packed_pp_pull_dst_handles = {engine_id: {(0, 0): 20, (1, 0): 21}}
+        worker._packed_pp_pull_region_indices = {
+            engine_id: {
+                (0, 0): [[0], []],
+                (1, 0): [[0], [1]],
+            }
+        }
+        worker._read_blocks = MagicMock()
+
+        meta = ReqMeta(
+            local_block_ids=([1], [2]),
+            local_physical_block_ids=([1], [2]),
+            tp_size=2,
+            pp_size=2,
+            remote=RemoteMeta(
+                block_ids=([3], [4]),
+                host="localhost",
+                port=1234,
+                engine_id=engine_id,
+                request_id="prefill-request",
+            ),
+        )
+
+        worker._read_blocks_for_req("decode-request", meta)
+
+        assert worker._read_blocks.call_count == 2
+        first, second = worker._read_blocks.call_args_list
+        assert first.kwargs["remote_pp_rank"] == 0
+        assert first.kwargs["local_xfer_side_handle"] == 10
+        assert first.kwargs["remote_xfer_side_handle"] == 20
+        assert first.kwargs["packed_region_indices_by_group"] == [[0], []]
+        assert second.kwargs["remote_pp_rank"] == 1
+        assert second.kwargs["local_xfer_side_handle"] == 11
+        assert second.kwargs["remote_xfer_side_handle"] == 21
+        assert second.kwargs["packed_region_indices_by_group"] == [[0], [1]]
 
 
 class TestPushWriterMlaReplication:
