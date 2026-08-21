@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Metadata dataclasses and helpers for the NIXL connector."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,8 +44,19 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #      clock-sync timestamp
 #   6: Validate EAGLE/MTP speculative configuration compatibility
 #   7: Include NIXL transfer mode (push vs pull) in the compatibility hash
+#   8: Describe packed KV regions for pipeline-parallel producers
 #
-NIXL_CONNECTOR_VERSION: int = 7
+NIXL_CONNECTOR_VERSION: int = 8
+
+
+@dataclass(frozen=True)
+class NixlPackedKVRegion:
+    """One named layer segment within a packed KV-cache block."""
+
+    group_id: int
+    layer_name: str
+    offset: int
+    length: int
 
 
 @dataclass
@@ -60,6 +72,8 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    packed_kv_cache_regions: list[NixlPackedKVRegion] | None = None
+    packed_kv_cache_block_stride: int = 0
 
 
 @dataclass
@@ -125,7 +139,7 @@ def _get_speculative_compatibility_factors(
 
 def compute_nixl_compatibility_hash(
     vllm_config: VllmConfig,
-    attn_backend_name: str,
+    attn_backend_name: str | Sequence[str],
     cross_layers_blocks: bool,
     transfer_mode: str = "pull",
 ) -> str:
@@ -164,6 +178,14 @@ def compute_nixl_compatibility_hash(
     cache_config = vllm_config.cache_config
     is_hma_enabled = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
 
+    attn_backend_names: str | tuple[str, ...]
+    if isinstance(attn_backend_name, str):
+        attn_backend_names = attn_backend_name
+    else:
+        # PP stages can discover the same set of backends in different layer
+        # traversal order. The order does not affect KV compatibility.
+        attn_backend_names = tuple(sorted(set(attn_backend_name)))
+
     factors = {
         # Version compatibility
         "vllm_version": vllm_version,
@@ -175,7 +197,7 @@ def compute_nixl_compatibility_hash(
         "head_size": model_config.get_head_size(),
         "num_hidden_layers": model_config.get_total_num_hidden_layers(),
         # Attention backend and KV cache dtype affect memory layout
-        "attn_backend_name": attn_backend_name,
+        "attn_backend_name": attn_backend_names,
         "cache_dtype": str(cache_config.cache_dtype),
         "cross_layers_blocks": cross_layers_blocks,
         "is_hma_enabled": is_hma_enabled,
@@ -193,7 +215,7 @@ def compute_nixl_compatibility_hash(
         factors["dtype"],
         factors["num_kv_heads"],
         factors["cache_dtype"],
-        attn_backend_name,
+        attn_backend_names,
     )
     return compat_hash
 
@@ -228,7 +250,7 @@ class ReqMeta:
     remote: RemoteMeta | None = None
     # Remote block size, discovered during NIXL handshake (push mode).
     remote_block_size: int | None = None
-    # Remote producer pipeline-parallel size (push mode, D side).
+    # Remote producer pipeline-parallel size (D side).
     pp_size: int = 1
 
 

@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
+    NixlPackedKVRegion,
     ReqId,
     ReqMeta,
     TransferHandle,
@@ -96,6 +97,24 @@ class NixlBaseConnectorWorker:
     # Overridden by NixlPushConnectorWorker.
     _TRANSFER_MODE: str = "pull"
 
+    @staticmethod
+    def _compute_packed_desc_ids(
+        block_ids: BlockIds,
+        dst_num_blocks: int,
+        region_indices_by_group: list[list[int]],
+    ) -> np.ndarray:
+        desc_ids: list[np.ndarray] = []
+        for group_id, group_block_ids in enumerate(block_ids):
+            group_arr = np.asarray(group_block_ids, dtype=np.int64)
+            region_indices = region_indices_by_group[group_id]
+            if group_arr.size == 0 or not region_indices:
+                continue
+            region_ids = np.asarray(region_indices, dtype=np.int64)[:, None]
+            desc_ids.append((region_ids * dst_num_blocks + group_arr).flatten())
+        if not desc_ids:
+            return np.empty(0, dtype=np.int64)
+        return np.concatenate(desc_ids)
+
     def _compute_desc_ids(
         self,
         block_ids: BlockIds,
@@ -104,6 +123,14 @@ class NixlBaseConnectorWorker:
         physical_blocks_per_logical: int,
     ) -> np.ndarray:
         """Compute NIXL descriptor IDs for given block IDs."""
+        if getattr(self, "_use_packed_pp_descriptors", False):
+            assert block_size_ratio in (None, 1)
+            return self._compute_packed_desc_ids(
+                block_ids,
+                dst_num_blocks,
+                self._packed_region_indices_by_group,
+            )
+
         num_ssm_regions = 0
         if self._has_mamba:
             assert self._conv_decomp is not None
@@ -437,14 +464,44 @@ class NixlBaseConnectorWorker:
         # (so 1 per layer for MLA, otherwise 2 per layer)
         self.num_regions = 0
 
-        # PP>1 (push mode): this worker holds a contiguous layer slice and
-        # transfers into the matching sub-range of a PP=1 remote's regions.
+        # PP>1 producer workers hold disjoint layer slices. Packed KV layouts
+        # need named sub-region descriptors because the physical allocation is
+        # one interleaved slab rather than one independently addressable tensor
+        # per layer.
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self._remote_region_offset = 0
+        self._uses_packed_kv_cache = any(
+            tensor.block_stride > 0
+            for tensor in self.kv_cache_config.kv_cache_tensors
+        )
+        self._use_packed_pp_descriptors = (
+            self._TRANSFER_MODE == "push"
+            and self.pp_size > 1
+            and self._uses_packed_kv_cache
+        )
+        self._packed_kv_cache_regions: list[NixlPackedKVRegion] = []
+        self._packed_region_indices_by_group: list[list[int]] = []
+        self._packed_kv_cache_block_stride = 0
+        # Pull-mode D workers prepare one descriptor pair per remote PP stage:
+        # a local view into the full-model slab and a remote view into that
+        # stage's compact slab. Both views use the remote stage's region order.
+        self._packed_pp_pull_src_handles = defaultdict[
+            EngineId, dict[tuple[int, int], int]
+        ](dict)
+        self._packed_pp_pull_dst_handles = defaultdict[
+            EngineId, dict[tuple[int, int], int]
+        ](dict)
+        self._packed_pp_pull_region_indices = defaultdict[
+            EngineId, dict[tuple[int, int], list[list[int]]]
+        ](dict)
         # PP push slices regions per layer (uniform count); HMA breaks that.
-        if self.pp_size > 1 and self._is_hma_required:
+        if (
+            self.pp_size > 1
+            and self._is_hma_required
+            and not self._uses_packed_kv_cache
+        ):
             raise NotImplementedError(
-                "NixlPushConnector does not support pipeline_parallel_size > 1 "
+                "NIXL does not support pipeline_parallel_size > 1 "
                 "with hybrid KV cache layouts (HMA) yet."
             )
         # Decode-side PP is unsupported (completions counted per consumer rank).
@@ -715,7 +772,11 @@ class NixlBaseConnectorWorker:
                     )
                 else:
                     remote_agent_name = self.add_remote_agent(
-                        metadata, remote_rank, remote_tp_size
+                        metadata,
+                        remote_rank,
+                        remote_tp_size,
+                        remote_pp_rank,
+                        remote_pp_size,
                     )
                 setup_agent_time = time.perf_counter()
                 logger.debug(
@@ -924,6 +985,7 @@ class NixlBaseConnectorWorker:
             meta.remote.host,
             meta.remote.port,
             meta.tp_size,
+            meta.pp_size,
         )
         if fut is None:
             # Already handshaked — only happens if caller does not pre-check.
@@ -980,13 +1042,14 @@ class NixlBaseConnectorWorker:
         )
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config,
-            self.backend_name,
+            [backend.get_name() for backend in self.attn_backends],
             self.transfer_topo.cross_layers_blocks,
             transfer_mode=self._TRANSFER_MODE,
         )
 
         total_size = storage.nbytes()
         block_stride = total_size // self.num_blocks
+        packed_regions = self._describe_packed_kv_cache(block_stride)
         base_addr = storage.data_ptr()
         device_id = storage.device.index
         assert device_id is not None
@@ -1002,9 +1065,26 @@ class NixlBaseConnectorWorker:
         self.device_id = device_id
         caches_data = [(base_addr, total_size, self.device_id, "")]
 
-        self.block_len_per_layer = [block_stride]
-        self.num_regions = 1
-        self.num_descs = self.num_blocks
+        self._packed_kv_cache_regions = packed_regions
+        self._packed_kv_cache_block_stride = block_stride
+        if self._use_packed_pp_descriptors:
+            self.block_len_per_layer = [region.length for region in packed_regions]
+            self.num_regions = len(packed_regions)
+            self.num_descs = self.num_regions * self.num_blocks
+            self._region_is_mla = [True] * self.num_regions
+            num_groups = len(self.kv_cache_config.kv_cache_groups)
+            self._packed_region_indices_by_group = [
+                [
+                    region_idx
+                    for region_idx, region in enumerate(packed_regions)
+                    if region.group_id == group_id
+                ]
+                for group_id in range(num_groups)
+            ]
+        else:
+            self.block_len_per_layer = [block_stride]
+            self.num_regions = 1
+            self.num_descs = self.num_blocks
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [base_addr]
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
@@ -1033,6 +1113,8 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            packed_kv_cache_regions=packed_regions,
+            packed_kv_cache_block_stride=block_stride,
         )
         assert self.compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
@@ -1041,19 +1123,51 @@ class NixlBaseConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
+    def _describe_packed_kv_cache(
+        self, block_stride: int
+    ) -> list[NixlPackedKVRegion]:
+        if self._physical_blocks_per_logical_kv_block != 1:
+            raise NotImplementedError(
+                "Packed KV transfer does not support differing logical and "
+                "kernel block sizes."
+            )
+        tensor_by_layer = {
+            layer_name: tensor
+            for tensor in self.kv_cache_config.kv_cache_tensors
+            for layer_name in tensor.shared_by
+        }
+        regions: list[NixlPackedKVRegion] = []
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            group_spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                tensor = tensor_by_layer[layer_name]
+                if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                    layer_spec = group_spec.kv_cache_specs[layer_name]
+                else:
+                    layer_spec = group_spec
+                assert tensor.block_stride == block_stride
+                regions.append(
+                    NixlPackedKVRegion(
+                        group_id=group_id,
+                        layer_name=layer_name,
+                        offset=tensor.offset,
+                        length=layer_spec.page_size_bytes,
+                    )
+                )
+        return regions
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
         # Detect packed allocation: all tensors are strided views into the
         # same backing storage (different data_ptr but same storage).
         # This happens with DSv4-style contiguous per-block packing.
-        if len(kv_caches) > 1 and not self._has_mamba:
+        if self._uses_packed_kv_cache and not self._has_mamba:
             storage = next(iter(kv_caches.values())).untyped_storage()
             storage_ptrs = {
                 cache.untyped_storage().data_ptr() for cache in kv_caches.values()
             }
-            data_ptrs = {cache.data_ptr() for cache in kv_caches.values()}
-            if len(storage_ptrs) == 1 and len(data_ptrs) > 1:
+            if len(storage_ptrs) == 1:
                 self._register_packed_kv_cache(storage)
                 self.device_kv_caches = kv_caches
                 return
@@ -1074,7 +1188,7 @@ class NixlBaseConnectorWorker:
         )
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config,
-            self.backend_name,
+            [backend.get_name() for backend in self.attn_backends],
             self.transfer_topo.cross_layers_blocks,
             transfer_mode=self._TRANSFER_MODE,
         )
@@ -1411,6 +1525,171 @@ class NixlBaseConnectorWorker:
             parts.append(self._stack_descs(addrs, block_len, device_id))
         return np.concatenate(parts)
 
+    def _build_packed_local(self) -> np.ndarray:
+        assert self._packed_kv_cache_regions
+        base_addr = self.kv_caches_base_addr[self.engine_id][self.tp_rank][0]
+        block_arange = np.arange(self.num_blocks, dtype=np.uint64)
+        parts = [
+            self._stack_descs(
+                base_addr
+                + region.offset
+                + block_arange * self._packed_kv_cache_block_stride,
+                region.length,
+                self.device_id,
+            )
+            for region in self._packed_kv_cache_regions
+        ]
+        return np.concatenate(parts)
+
+    def _build_packed_remote(
+        self, nixl_agent_meta: NixlAgentMetadata
+    ) -> np.ndarray:
+        remote_regions = nixl_agent_meta.packed_kv_cache_regions
+        if not remote_regions or nixl_agent_meta.packed_kv_cache_block_stride <= 0:
+            raise RuntimeError(
+                "A pipeline-parallel packed-KV producer requires packed layout "
+                "metadata from the decode worker."
+            )
+        if len(nixl_agent_meta.kv_caches_base_addr) != 1:
+            raise RuntimeError("Packed KV metadata must expose one backing region.")
+        remote_by_layer = {
+            (region.group_id, region.layer_name): region
+            for region in remote_regions
+        }
+        base_addr = nixl_agent_meta.kv_caches_base_addr[0]
+        block_arange = np.arange(nixl_agent_meta.num_blocks, dtype=np.uint64)
+        parts: list[np.ndarray] = []
+        for local_region in self._packed_kv_cache_regions:
+            key = (local_region.group_id, local_region.layer_name)
+            remote_region = remote_by_layer.get(key)
+            if remote_region is None:
+                raise RuntimeError(
+                    "Remote packed KV layout is missing producer layer "
+                    f"{local_region.layer_name!r} in group {local_region.group_id}."
+                )
+            if remote_region.length != local_region.length:
+                raise RuntimeError(
+                    "Packed KV layer sizes differ between producer and consumer: "
+                    f"{local_region.layer_name!r} local={local_region.length}, "
+                    f"remote={remote_region.length}."
+                )
+            addrs = (
+                base_addr
+                + remote_region.offset
+                + block_arange * nixl_agent_meta.packed_kv_cache_block_stride
+            )
+            parts.append(
+                self._stack_descs(
+                    addrs, local_region.length, nixl_agent_meta.device_id
+                )
+            )
+        return np.concatenate(parts)
+
+    def _build_packed_region_descriptors(
+        self,
+        *,
+        base_addr: int,
+        num_blocks: int,
+        block_stride: int,
+        regions: list[NixlPackedKVRegion],
+        device_id: int,
+    ) -> np.ndarray:
+        """Build region-major descriptors for one packed KV allocation."""
+        block_arange = np.arange(num_blocks, dtype=np.uint64)
+        return np.concatenate(
+            [
+                self._stack_descs(
+                    base_addr + region.offset + block_arange * block_stride,
+                    region.length,
+                    device_id,
+                )
+                for region in regions
+            ]
+        )
+
+    def _prepare_packed_pp_pull_handles(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_agent_name: str,
+        remote_pp_rank: int,
+        remote_tp_rank: int,
+    ) -> None:
+        """Prepare matching D/P descriptor lists for one remote PP stage."""
+        remote_regions = nixl_agent_meta.packed_kv_cache_regions
+        if not remote_regions or nixl_agent_meta.packed_kv_cache_block_stride <= 0:
+            raise RuntimeError(
+                "A pipeline-parallel packed-KV producer must provide named "
+                "packed layout metadata."
+            )
+        if len(nixl_agent_meta.kv_caches_base_addr) != 1:
+            raise RuntimeError("Packed KV metadata must expose one backing region.")
+        if nixl_agent_meta.block_size != self.block_size:
+            raise NotImplementedError(
+                "Packed PP KV transfer requires matching P/D block sizes."
+            )
+
+        local_by_layer = {
+            (region.group_id, region.layer_name): region
+            for region in self._packed_kv_cache_regions
+        }
+        local_regions: list[NixlPackedKVRegion] = []
+        for remote_region in remote_regions:
+            key = (remote_region.group_id, remote_region.layer_name)
+            local_region = local_by_layer.get(key)
+            if local_region is None:
+                raise RuntimeError(
+                    "Local packed KV layout is missing producer layer "
+                    f"{remote_region.layer_name!r} in group "
+                    f"{remote_region.group_id}."
+                )
+            if local_region.length != remote_region.length:
+                raise RuntimeError(
+                    "Packed KV layer sizes differ between producer and consumer: "
+                    f"{remote_region.layer_name!r} local={local_region.length}, "
+                    f"remote={remote_region.length}."
+                )
+            local_regions.append(local_region)
+
+        local_base_addr = self.kv_caches_base_addr[self.engine_id][self.tp_rank][0]
+        local_blocks_data = self._build_packed_region_descriptors(
+            base_addr=local_base_addr,
+            num_blocks=self.num_blocks,
+            block_stride=self._packed_kv_cache_block_stride,
+            regions=local_regions,
+            device_id=self.device_id,
+        )
+        remote_blocks_data = self._build_packed_region_descriptors(
+            base_addr=nixl_agent_meta.kv_caches_base_addr[0],
+            num_blocks=nixl_agent_meta.num_blocks,
+            block_stride=nixl_agent_meta.packed_kv_cache_block_stride,
+            regions=remote_regions,
+            device_id=nixl_agent_meta.device_id,
+        )
+
+        key = (remote_pp_rank, remote_tp_rank)
+        local_descs = self.nixl_wrapper.get_xfer_descs(
+            local_blocks_data, self.nixl_memory_type
+        )
+        remote_descs = self.nixl_wrapper.get_xfer_descs(
+            remote_blocks_data, self.nixl_memory_type
+        )
+        self._packed_pp_pull_src_handles[nixl_agent_meta.engine_id][key] = (
+            self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", local_descs)
+        )
+        self._packed_pp_pull_dst_handles[nixl_agent_meta.engine_id][key] = (
+            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, remote_descs)
+        )
+
+        num_groups = len(self.kv_cache_config.kv_cache_groups)
+        self._packed_pp_pull_region_indices[nixl_agent_meta.engine_id][key] = [
+            [
+                region_idx
+                for region_idx, region in enumerate(remote_regions)
+                if region.group_id == group_id
+            ]
+            for group_id in range(num_groups)
+        ]
+
     def _build_fa_remote(
         self,
         plan: TPMapping,
@@ -1419,6 +1698,12 @@ class NixlBaseConnectorWorker:
     ) -> np.ndarray:
         """Build remote FA descriptors for all layers as an Nx3 uint64 array."""
         assert self.transfer_topo is not None
+        if getattr(self, "_use_packed_pp_descriptors", False):
+            if block_size_ratio != 1:
+                raise NotImplementedError(
+                    "Packed PP KV transfer requires matching P/D block sizes."
+                )
+            return self._build_packed_remote(nixl_agent_meta)
         assert nixl_agent_meta.kv_caches_base_addr, (
             "Remote KV cache base addresses must not be empty."
         )
@@ -1473,7 +1758,16 @@ class NixlBaseConnectorWorker:
         block_size_ratio = self.block_size // block_size
         local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
 
-        blocks_data = self._build_fa_local(local_base_addresses, block_size_ratio)
+        if getattr(self, "_use_packed_pp_descriptors", False):
+            if block_size_ratio != 1:
+                raise NotImplementedError(
+                    "Packed PP KV transfer requires matching P/D block sizes."
+                )
+            blocks_data = self._build_packed_local()
+        else:
+            blocks_data = self._build_fa_local(
+                local_base_addresses, block_size_ratio
+            )
         logger.debug(
             "Created %s blocks for src engine %s and rank %s on device id %s",
             len(blocks_data),
@@ -1502,6 +1796,8 @@ class NixlBaseConnectorWorker:
         nixl_agent_meta: NixlAgentMetadata,
         remote_tp_rank: int = 0,
         remote_tp_size: int = 1,
+        remote_pp_rank: int = 0,
+        remote_pp_size: int = 1,
     ) -> str:
         """
         Add the remote NIXL agent and prepare the descriptors for reading cache
@@ -1548,14 +1844,15 @@ class NixlBaseConnectorWorker:
         """  # noqa: E501
         engine_id = nixl_agent_meta.engine_id
         # TODO re-evaluate refreshing for scaling/recovery
-        if (0, remote_tp_rank) in self._remote_agents.get(engine_id, {}):
+        remote_rank_key = (remote_pp_rank, remote_tp_rank)
+        if remote_rank_key in self._remote_agents.get(engine_id, {}):
             logger.debug(
                 "Remote agent with engine_id %s and rank"
                 "%s already exchanged metadata, skip handshake.",
                 engine_id,
                 remote_tp_rank,
             )
-            return self._remote_agents[engine_id][(0, remote_tp_rank)]
+            return self._remote_agents[engine_id][remote_rank_key]
 
         # Number of physical regions registered locally (one per layer/tensor).
         num_local_regions = len(self.block_len_per_layer)
@@ -1599,6 +1896,13 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta.agent_metadata
         )
 
+        packed_pp_pull = (
+            self._TRANSFER_MODE == "pull"
+            and remote_pp_size > 1
+            and bool(self._packed_kv_cache_regions)
+            and bool(nixl_agent_meta.packed_kv_cache_regions)
+        )
+
         # Create dst descs and xfer side handles. TP workers have same #blocks
         # so we only register once per engine_id.
         # Example:
@@ -1615,6 +1919,23 @@ class NixlBaseConnectorWorker:
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
             nixl_agent_meta.kv_caches_base_addr
         )
+        if packed_pp_pull:
+            if (
+                nixl_agent_meta.physical_blocks_per_logical_kv_block != 1
+                or self._physical_blocks_per_logical_kv_block != 1
+            ):
+                raise NotImplementedError(
+                    "Packed PP KV transfer requires identical logical and "
+                    "kernel block sizes."
+                )
+            self._prepare_packed_pp_pull_handles(
+                nixl_agent_meta,
+                remote_agent_name,
+                remote_pp_rank,
+                remote_tp_rank,
+            )
+            return remote_agent_name
+
         self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
 
         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
@@ -1831,6 +2152,29 @@ class NixlBaseConnectorWorker:
                 f"local={self.block_len_per_layer}, "
                 f"remote={nixl_agent_meta.block_lens}."
             )
+        elif getattr(self, "_use_packed_pp_descriptors", False):
+            remote_regions = nixl_agent_meta.packed_kv_cache_regions
+            if not remote_regions:
+                raise RuntimeError("Remote agent did not provide packed KV metadata.")
+            remote_by_layer = {
+                (region.group_id, region.layer_name): region
+                for region in remote_regions
+            }
+            for local_region in self._packed_kv_cache_regions:
+                remote_region = remote_by_layer.get(
+                    (local_region.group_id, local_region.layer_name)
+                )
+                if remote_region is None:
+                    raise RuntimeError(
+                        "Remote packed KV layout is missing producer layer "
+                        f"{local_region.layer_name!r}."
+                    )
+                if local_region.length // block_size_ratio != remote_region.length:
+                    raise RuntimeError(
+                        "Packed KV layer sizes must match between P and D: "
+                        f"{local_region.layer_name!r} local={local_region.length}, "
+                        f"remote={remote_region.length}, bsr={block_size_ratio}."
+                    )
         elif not self._has_mamba:
             assert len(self.block_len_per_layer) == len(nixl_agent_meta.block_lens), (
                 "Number of KV layers must match between prefill and decode"
@@ -1874,7 +2218,12 @@ class NixlBaseConnectorWorker:
         # TP workers that handhshake with same remote have same #blocks.
         assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
         # Same number of regions/~layers.
-        assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
+        if getattr(self, "_use_packed_pp_descriptors", False):
+            assert len(nixl_agent_meta.kv_caches_base_addr) == 1
+        else:
+            assert len(nixl_agent_meta.kv_caches_base_addr) == len(
+                self.block_len_per_layer
+            )
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
         """copy recved kv from host buffer to device."""
@@ -2571,6 +2920,14 @@ class NixlBaseConnectorWorker:
         # Notif-only engines (push-mode D side) have no descriptor state.
         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
             self.nixl_wrapper.release_dlist_handle(handle)
+        packed_src_handles = getattr(self, "_packed_pp_pull_src_handles", {})
+        for handle in packed_src_handles.pop(engine_id, {}).values():
+            self.nixl_wrapper.release_dlist_handle(handle)
+        packed_dst_handles = getattr(self, "_packed_pp_pull_dst_handles", {})
+        for handle in packed_dst_handles.pop(engine_id, {}).values():
+            self.nixl_wrapper.release_dlist_handle(handle)
+        packed_region_indices = getattr(self, "_packed_pp_pull_region_indices", {})
+        packed_region_indices.pop(engine_id, None)
         for agent_name in self._remote_agents.pop(engine_id).values():
             self.nixl_wrapper.remove_remote_agent(agent_name)
 
