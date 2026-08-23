@@ -53,6 +53,21 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _interleave_deepgemm_swiglu_rows(weight_or_scale: torch.Tensor) -> torch.Tensor:
+    """Reorder [gate..., up...] rows into adjacent gate/up pairs."""
+    n = weight_or_scale.shape[1]
+    assert n % 2 == 0
+    return (
+        torch.stack(
+            (weight_or_scale[:, : n // 2], weight_or_scale[:, n // 2 :]),
+            dim=2,
+        )
+        .flatten(1, 2)
+        .contiguous()
+    )
+
+
 if has_triton_kernels():
     try:
         from triton_kernels.matmul_ogs import PrecisionConfig
@@ -1289,6 +1304,19 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         is_gfx1250 = on_gfx1250()
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+        # The SM120 fused FC1 epilogue consumes adjacent gate/up MMA outputs.
+        # Reorder both packed FP4 rows and their still-unpacked scale rows
+        # before converting the latter to DeepGEMM's TMA layout. Older
+        # DeepGEMM builds keep the original layout and execution path.
+        from vllm.utils.deep_gemm import is_deep_gemm_fused_swiglu_supported
+
+        use_fused_swiglu = (
+            activation == MoEActivation.SILU and is_deep_gemm_fused_swiglu_supported()
+        )
+        if use_fused_swiglu:
+            w13_weight = _interleave_deepgemm_swiglu_rows(w13_weight)
+            w13_weight_scale = _interleave_deepgemm_swiglu_rows(w13_weight_scale)
+
         w13_weight_scale, w2_weight_scale = _pack_deepgemm_mxfp4_scales(
             w13_weight,
             w2_weight,

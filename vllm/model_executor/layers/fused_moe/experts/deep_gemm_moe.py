@@ -40,8 +40,10 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
     get_mk_alignment_for_contiguous_layout,
+    is_deep_gemm_fused_swiglu_supported,
     is_deep_gemm_supported,
     m_grouped_fp8_fp4_gemm_nt_contiguous,
+    m_grouped_fp8_fp4_gemm_nt_contiguous_swiglu,
     m_grouped_fp8_gemm_nt_contiguous,
     mk_alignment_scope,
 )
@@ -590,26 +592,59 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment;
         # see DeepGemmExperts.apply for rationale.
         with mk_alignment_scope(align_used):
-            # FC1: FP8 activations x FP4 weights
-            # DeepGEMM 2.4.2 requires FP4-packed weights as int8 (kPackedFP4).
-            mm1_out = _resize_cache(workspace2, (M_sum, N))
-            m_grouped_fp8_fp4_gemm_nt_contiguous(
-                (a1q, a1q_scale),
-                (w1.view(torch.int8), self.w1_scale),
-                mm1_out,
-                expert_ids,
-                recipe_a=(1, self._ACT_BLOCK_K),
-                recipe_b=(1, self._WEIGHT_BLOCK_K),
-            )
-
-            # SwiGLU activation + FP8 requant
             activation_out_dim = self.adjust_N_for_activation(N, activation)
             quant_out = _resize_cache(
                 workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
             )
-            a2q, a2q_scale = self._act_mul_quant(
-                input=mm1_out.view(-1, N), output=quant_out, activation=activation
+            use_fused_swiglu = (
+                activation == MoEActivation.SILU
+                and is_deep_gemm_fused_swiglu_supported()
             )
+            if use_fused_swiglu:
+                # w1 and w1_scale were pair-interleaved at model load. One
+                # SM120 GEMM now writes the post-SwiGLU FP8 activation and its
+                # packed UE8M0 scales directly, avoiding the BF16 FC1 tensor.
+                groups_per_row = activation_out_dim // self._ACT_BLOCK_K
+                packs_per_row = (groups_per_row + 3) // 4
+                aligned_m = (M_sum + 3) // 4 * 4
+                a2q_scale = torch.empty_strided(
+                    (M_sum, packs_per_row),
+                    (1, aligned_m),
+                    dtype=torch.int32,
+                    device=a1q.device,
+                )
+                m_grouped_fp8_fp4_gemm_nt_contiguous_swiglu(
+                    (a1q, a1q_scale),
+                    (w1.view(torch.int8), self.w1_scale),
+                    quant_out,
+                    a2q_scale,
+                    expert_ids,
+                    recipe_a=(1, self._ACT_BLOCK_K),
+                    recipe_b=(1, self._WEIGHT_BLOCK_K),
+                    activation_clamp=(
+                        self.gemm1_clamp_limit
+                        if self.gemm1_clamp_limit is not None
+                        else float("inf")
+                    ),
+                )
+                a2q = quant_out
+            else:
+                # FC1: FP8 activations x FP4 weights. DeepGEMM requires
+                # FP4-packed weights as int8 (kPackedFP4).
+                mm1_out = _resize_cache(workspace2, (M_sum, N))
+                m_grouped_fp8_fp4_gemm_nt_contiguous(
+                    (a1q, a1q_scale),
+                    (w1.view(torch.int8), self.w1_scale),
+                    mm1_out,
+                    expert_ids,
+                    recipe_a=(1, self._ACT_BLOCK_K),
+                    recipe_b=(1, self._WEIGHT_BLOCK_K),
+                )
+                a2q, a2q_scale = self._act_mul_quant(
+                    input=mm1_out.view(-1, N),
+                    output=quant_out,
+                    activation=activation,
+                )
 
             # FC2: FP8 activations x FP4 weights
             mm2_out = _resize_cache(workspace2, (M_sum, K))

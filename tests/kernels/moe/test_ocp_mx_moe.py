@@ -1113,6 +1113,51 @@ def test_convert_standard_mxfp4_weights_for_flashinfer_cutlass(
     torch.testing.assert_close(interleaved_scales[1], w2_scale)
 
 
+@pytest.mark.parametrize("fused_swiglu", [False, True])
+def test_convert_standard_mxfp4_weights_for_deepgemm_swiglu(monkeypatch, fused_swiglu):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.oracle import mxfp4
+
+    w13 = torch.arange(32, dtype=torch.uint8).reshape(1, 4, 8)
+    w2 = torch.arange(16, dtype=torch.uint8).reshape(1, 4, 4)
+    w13_scale = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
+    w2_scale = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+
+    monkeypatch.setattr(
+        "vllm.utils.deep_gemm.is_deep_gemm_fused_swiglu_supported",
+        lambda: fused_swiglu,
+    )
+    monkeypatch.setattr(
+        mxfp4,
+        "_pack_deepgemm_mxfp4_scales",
+        lambda _w13, _w2, s13, s2: (s13, s2),
+    )
+    converted = mxfp4.convert_weight_to_mxfp4_moe_kernel_format(
+        mxfp4.Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        types.SimpleNamespace(),
+        w13,
+        w2,
+        w13_scale,
+        w2_scale,
+        activation=MoEActivation.SILU,
+    )
+
+    expected_w13 = (
+        torch.stack((w13[:, :2], w13[:, 2:]), dim=2).flatten(1, 2)
+        if fused_swiglu
+        else w13
+    )
+    expected_w13_scale = (
+        torch.stack((w13_scale[:, :2], w13_scale[:, 2:]), dim=2).flatten(1, 2)
+        if fused_swiglu
+        else w13_scale
+    )
+    torch.testing.assert_close(converted[0], expected_w13)
+    torch.testing.assert_close(converted[1], w2)
+    torch.testing.assert_close(converted[2], expected_w13_scale)
+    torch.testing.assert_close(converted[3], w2_scale)
+
+
 def test_gpt_oss_quant_config_supplies_clamped_swiglu_params():
     from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
     from vllm.model_executor.layers.quantization.mxfp4 import GptOssMxfp4MoEMethod
