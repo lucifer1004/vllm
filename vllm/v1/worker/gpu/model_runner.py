@@ -97,7 +97,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
 )
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
@@ -760,6 +760,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
+        dp_sync = self.execute_model_state.dp_sync
         self.execute_model_state = None
 
         self.step_timing.forward_end()
@@ -821,6 +822,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         next_prefill_tokens=self.req_states.next_prefill_tokens,
                         temperature=self.sampler.sampling_states.temperature.gpu,
                         seeds=self.sampler.sampling_states.seeds.gpu,
+                        dp_sync=dp_sync,
                         dummy_run=True,
                         skip_attn_for_dummy_run=skip_attn,
                         mm_inputs=mm_inputs,
@@ -932,10 +934,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model_state.encoder_runner.capture()
 
             if capture_decoder:
+                input_buffers = self.input_buffers
+                if self.pcp_manager is not None:
+                    input_buffers = self.pcp_manager.input_buffers
                 self.cudagraph_manager.capture(
                     self.model,
                     self.model_state,
-                    self.input_buffers,
+                    input_buffers,
                     self.intermediate_tensors,
                     self.block_tables,
                     self.attn_groups,
@@ -1166,7 +1171,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_desc: BatchExecutionDescriptor,
     ) -> InputBatch:
         num_tokens = batch_req_state.num_tokens
-        num_tokens_after_padding = batch_desc.num_tokens
+        num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
@@ -1358,7 +1363,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else None
             ),
         )
-        return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
+        return pcp.maybe_partition_pcp_batch(
+            self.pcp_manager,
+            input_batch,
+            padded_num_tokens=batch_desc.num_tokens,
+        )
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -1542,6 +1551,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
+            if self.pcp_manager is not None:
+                num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
+                    batch_req_state.num_scheduled_tokens,
+                    batch_req_state.is_prefilling_np,
+                )
 
         num_active_loras = 0
         if self.lora_config:
@@ -1557,7 +1571,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
             num_toks,
@@ -1744,7 +1758,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
+                num_tokens_across_dp=(
+                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
+                ),
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
@@ -1790,6 +1806,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
+            dp_sync=dp_sync,
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
@@ -1814,6 +1831,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
+        dp_sync = self.execute_model_state.dp_sync
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
@@ -1950,6 +1968,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.req_states.next_prefill_tokens,
                         self.sampler.sampling_states.temperature.gpu,
                         self.sampler.sampling_states.seeds.gpu,
+                        dp_sync=dp_sync,
                         mm_inputs=mm_inputs,
                     )
             if draft_tokens is not None:
@@ -2095,6 +2114,7 @@ class ExecuteModelState(NamedTuple):
     slot_mappings_by_layer: dict[str, torch.Tensor] | None
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
+    dp_sync: DPSyncState | None
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
