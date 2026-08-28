@@ -577,6 +577,35 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
             )
+        # Persistent SM120 runner: one per layer, created at init so its
+        # pre-allocated LSE buffer predates any CUDA graph capture. Private
+        # FlashInfer modules; upstreaming needs public exports.
+        from flashinfer.mla._core import (
+            _normalize_optional_mla_sink,
+            _sparse_mla_decode_workspace,
+        )
+        from flashinfer.mla._sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
+
+        # One step runs at most max_num_batched_tokens (covers both decode
+        # batches and prefill chunks); full-CG decode capture may pad up to
+        # the largest capture size (already in token units, spec-inclusive).
+        max_cg_tokens = vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        max_tokens = max(
+            vllm_config.scheduler_config.max_num_batched_tokens, max_cg_tokens
+        )
+        self._fi_decode_workspace = _sparse_mla_decode_workspace
+        self._fi_runner = _SparseMLAPagedAttentionRunner(
+            max_num_tokens=max_tokens,
+            max_num_heads=self.padded_heads,
+            d_v=512,
+            kv_scale_format="auto",
+            device=torch.device("cuda", torch.accelerator.current_device_index()),
+        )
+        # Identity for a bare tensor sink; kept for parity with the
+        # functional entry point.
+        self._fi_attn_sink = _normalize_optional_mla_sink(
+            self.attn_sink, "backend='sparse'"
+        )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
@@ -744,7 +773,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         is_valid,
                     )
                 )
-                extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
+                extra_sparse_indices = global_indices.view(num_decode_tokens, -1)
             else:
                 extra_sparse_indices = attn_metadata.c128a_global_decode_topk_indices
                 extra_sparse_lengths = attn_metadata.c128a_decode_topk_lens
@@ -760,19 +789,33 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
-        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-            query=q,
-            swa_kv_cache=swa_cache,
-            workspace_buffer=self._get_workspace(q.device),
-            sparse_indices=swa_indices,
-            compressed_kv_cache=extra_cache,
-            out=output,
-            bmm1_scale=self.scale,
-            sinks=self.attn_sink,
-            kv_layout="NHD",
-            swa_topk_lens=swa_lens,
-            extra_sparse_indices=extra_sparse_indices,
-            extra_sparse_topk_lens=extra_sparse_lengths,
+        if extra_sparse_indices is not None:
+            # The c128a metadata carries an s_q=1 singleton dim; the runner
+            # takes flat 2-D [tokens, topk] rows.
+            extra_sparse_indices = extra_sparse_indices.view(num_decode_tokens, -1)
+        mid_out, mid_lse = self._fi_decode_workspace(
+            self._get_workspace(q.device),
+            num_tokens=num_decode_tokens,
+            num_heads=self.padded_heads,
+            d_v=512,
+            topk=swa_indices.shape[-1],
+            extra_topk=extra_sparse_indices.shape[-1]
+            if extra_sparse_indices is not None
+            else 0,
+        )
+        self._fi_runner.run(
+            q,
+            swa_cache,
+            swa_indices,
+            output,
+            self.scale,
+            topk_length=swa_lens,
+            attn_sink=self._fi_attn_sink,
+            extra_kv_cache=extra_cache,
+            extra_indices=extra_sparse_indices,
+            extra_topk_length=extra_sparse_lengths,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
         )
 
     def _forward_prefill(
@@ -879,17 +922,28 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_chunk,
-                swa_kv_cache=swa_kv_paged,
-                workspace_buffer=self._get_workspace(q.device),
-                sparse_indices=swa_indices_chunk,
-                compressed_kv_cache=extra_kv_paged,
-                out=output[query_start:query_end],
-                bmm1_scale=self.scale,
-                sinks=self.attn_sink,
-                kv_layout="NHD",
-                swa_topk_lens=swa_lens_chunk,
-                extra_sparse_indices=extra_sparse_indices_chunk,
-                extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+            chunk_tokens = int(query_end - query_start)
+            mid_out, mid_lse = self._fi_decode_workspace(
+                self._get_workspace(q.device),
+                num_tokens=chunk_tokens,
+                num_heads=self.padded_heads,
+                d_v=512,
+                topk=swa_indices_chunk.shape[-1],
+                extra_topk=extra_sparse_indices_chunk.shape[-1]
+                if extra_sparse_indices_chunk is not None
+                else 0,
+            )
+            self._fi_runner.run(
+                q_chunk,
+                swa_kv_paged,
+                swa_indices_chunk,
+                output[query_start:query_end],
+                self.scale,
+                topk_length=swa_lens_chunk,
+                attn_sink=self._fi_attn_sink,
+                extra_kv_cache=extra_kv_paged,
+                extra_indices=extra_sparse_indices_chunk,
+                extra_topk_length=extra_sparse_lengths_chunk,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
             )
