@@ -1113,18 +1113,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.postprocess_sampled(**outputs)
 
     def warmup_pp_decode_update(self) -> None:
-        """JIT-compile the kernel behind ``update_pp_decode_requests``.
+        """Preload PP state-update kernels before posting feedback receives.
 
-        That path only runs on real steps, so the warmup steps never reach it
-        on non-last PP ranks. Its first triton compile must not happen
-        mid-serving: the in-flight sampled-token broadcast keeps a NCCL kernel
-        spinning on this device, which blocks the CUDA module load and
-        deadlocks the pipeline. An all -1 idx_mapping makes this a no-op.
-        The freshly allocated int32 tensors are 16-byte aligned, matching the
-        padded views `PPHandler` produces at serving time (triton specializes
-        on pointer alignment).
+        The deferred path may not run during a short warmup trajectory. Use
+        scratch counters and a negative request index to preserve request state.
+        Aligned count buffers match PPHandler's padded receive buffers.
         """
         assert self.pp_handler is not None
+        post_update_num_computed_tokens(
+            torch.zeros(1, dtype=torch.int64, device=self.device),
+            torch.zeros(1, dtype=torch.int32, device=self.device),
+            torch.zeros(2, dtype=torch.int32, device=self.device),
+        )
         num_spec = self.pp_handler.max_sample_len - 1
         broadcast_drafts = (
             torch.zeros((1, num_spec), dtype=torch.int64, device=self.device)

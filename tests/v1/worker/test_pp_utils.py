@@ -14,7 +14,6 @@ from vllm.v1.worker.gpu import model_runner, pp_utils
 def _cuda_handler(max_sample_len=6):
     handler = object.__new__(pp_utils.PPHandler)
     handler.is_last_rank = True
-    handler.disabled = False
     handler.max_sample_len = max_sample_len
     handler.last_rank = 1
     handler.broadcast_group = Mock()
@@ -102,30 +101,6 @@ def test_decode_row_ahead_of_a_prefill_chunk():
     assert mask.tolist() == [True, False]
 
 
-def test_disabled_handler_skips_broadcast_and_receive(monkeypatch):
-    """While disabled (warmup), neither side enqueues a broadcast op."""
-    sent = []
-    monkeypatch.setattr(
-        pp_utils.torch.distributed,
-        "broadcast",
-        lambda *args, **kwargs: sent.append((args, kwargs)),
-    )
-
-    handler = object.__new__(pp_utils.PPHandler)
-    handler.set_disabled(True)
-
-    handler.is_last_rank = False
-    assert handler.receive(Mock()) is False
-
-    handler.is_last_rank = True
-    assert handler.broadcast(Mock(), Mock(), Mock(), Mock()) is None
-
-    assert sent == []
-
-    handler.set_disabled(False)
-    assert handler.disabled is False
-
-
 def test_alloc_combined_keeps_unbind_views_16_byte_aligned():
     """Triton specializes on pointer alignment: an unaligned `num_rejected`
     would compile a second `_post_update_kernel` variant at serving time,
@@ -147,6 +122,12 @@ def test_warmup_pp_decode_update_matches_serving_specialization(monkeypatch):
     """
     calls = []
     monkeypatch.setattr(model_runner, "post_update", lambda *args: calls.append(args))
+    computed_calls = []
+    monkeypatch.setattr(
+        model_runner,
+        "post_update_num_computed_tokens",
+        lambda *args: computed_calls.append(args),
+    )
 
     runner = object.__new__(model_runner.GPUModelRunner)
     runner.device = torch.device("cpu")
@@ -154,6 +135,12 @@ def test_warmup_pp_decode_update_matches_serving_specialization(monkeypatch):
     runner.req_states = Mock()
 
     runner.warmup_pp_decode_update()
+
+    assert len(computed_calls) == 1
+    indices, counters, query_start = computed_calls[0]
+    assert indices.dtype == torch.int64 and indices.tolist() == [0]
+    assert counters.dtype == torch.int32 and counters.tolist() == [0]
+    assert query_start.dtype == torch.int32 and query_start.tolist() == [0, 0]
 
     assert len(calls) == 1
     args = calls[0]

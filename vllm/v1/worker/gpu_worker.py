@@ -805,14 +805,10 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        # All warmup phases below run synthetic steps whose sampled outputs are
-        # discarded. The PP sampled-token broadcast would carry no payload, and
-        # its side-stream NCCL ops can overlap the next step's activation p2p
-        # and deadlock the pipeline, so keep it disabled for the whole warmup
-        # window and restore it before serving.
-        pp_handler = getattr(self.model_runner, "pp_handler", None)
-        if pp_handler is not None:
-            pp_handler.set_disabled(True)
+        if self.use_v2_model_runner:
+            model_runner = cast("GPUModelRunnerV2", self.model_runner)
+            if model_runner.pp_handler is not None and not model_runner.is_last_pp_rank:
+                model_runner.warmup_pp_decode_update()
 
         warmup_sizes: list[int] = []
 
@@ -991,9 +987,6 @@ class Worker(WorkerBase):
         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
         enable_gpu_sync_check()
-
-        if pp_handler is not None:
-            pp_handler.set_disabled(False)
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
