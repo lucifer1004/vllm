@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import importlib.metadata
+import math
+import mmap
 import os
 import random
 import sys
 import threading
-from collections.abc import Callable, Collection
+import weakref
+from collections.abc import Callable, Collection, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -900,6 +903,86 @@ def weak_ref_tensors(
         )
         return ret
     raise ValueError("Invalid type for tensors")
+
+
+def _unregister_host_chunks(mapping: mmap.mmap, pointers: list[int]) -> None:
+    # `mapping` keeps the pages alive until CUDA has released every chunk.
+    cudart = torch.cuda.cudart()
+    for pointer in pointers:
+        result = cudart.cudaHostUnregister(pointer)
+        if result.value != 0:
+            logger.warning("cudaHostUnregister failed: %s", result)
+
+
+def empty_pinned_cpu(
+    size: Sequence[int],
+    dtype: torch.dtype,
+    *,
+    max_registration_bytes: int | None = None,
+) -> torch.Tensor:
+    """Allocate an uninitialized pinned CPU tensor, even beyond a pinning cap.
+
+    Some kernels cap how much memory one pinning call may lock, so a large
+    ``pin_memory=True`` allocation fails with ``invalid argument``. In that case,
+    or when ``max_registration_bytes`` is given, the tensor is backed by an
+    anonymous mapping that CUDA registers in page-aligned chunks. Kernels can
+    read and write it through a UVA view, but a CUDA memcpy whose host range
+    spans two chunks fails, so such a tensor is for UVA access only.
+
+    Args:
+        size: Shape of the tensor.
+        dtype: Element type of the tensor.
+        max_registration_bytes: Register in chunks of at most this many bytes
+            instead of trying one pinned allocation first.
+
+    Returns:
+        A contiguous, pinned CPU tensor.
+
+    Raises:
+        RuntimeError: If CUDA rejects a chunk registration.
+
+    """
+    from vllm.platforms import current_platform
+
+    num_bytes = math.prod(size) * dtype.itemsize
+    if max_registration_bytes is None:
+        max_registration_bytes = 1 << 30
+        try:
+            return torch.empty(size, dtype=dtype, device="cpu", pin_memory=True)
+        except RuntimeError:
+            if not current_platform.is_cuda() or num_bytes <= max_registration_bytes:
+                raise
+        logger.warning(
+            "Pinning %d bytes in one call failed; registering it in chunks of "
+            "%d bytes. CUDA copies that span chunks are unsupported.",
+            num_bytes,
+            max_registration_bytes,
+        )
+    if num_bytes <= max_registration_bytes:
+        return torch.empty(size, dtype=dtype, device="cpu", pin_memory=True)
+
+    chunk_bytes = max(
+        mmap.PAGESIZE, max_registration_bytes - max_registration_bytes % mmap.PAGESIZE
+    )
+    mapping = mmap.mmap(-1, num_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    owner = np.frombuffer(mapping, dtype=np.uint8)
+    base = owner.ctypes.data
+    cudart = torch.cuda.cudart()
+    registered: list[int] = []
+    for offset in range(0, num_bytes, chunk_bytes):
+        length = min(chunk_bytes, num_bytes - offset)
+        result = cudart.cudaHostRegister(base + offset, length, 0)
+        if result.value != 0:
+            _unregister_host_chunks(mapping, registered)
+            raise RuntimeError(
+                f"cudaHostRegister of {length} bytes at offset {offset} of a "
+                f"{num_bytes}-byte pinned buffer failed: {result}"
+            )
+        registered.append(base + offset)
+    # Tensor views retain `owner`; its finalizer unregisters before unmapping.
+    finalizer = weakref.finalize(owner, _unregister_host_chunks, mapping, registered)
+    finalizer.atexit = False  # type: ignore[misc]
+    return torch.from_numpy(owner).view(dtype).view(size)
 
 
 def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tensor:
