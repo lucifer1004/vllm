@@ -923,19 +923,19 @@ def empty_pinned_cpu(
     """Allocate an uninitialized pinned CPU tensor, even beyond a pinning cap.
 
     Linux kernels with commit 53ba78de064b but without its fix 94efde1d1539
-    kmalloc a folio array per long-term pin, so pinning 2 GiB or more in one
-    call fails with ``invalid argument``, and large chunks can still fail when
-    that order-N allocation cannot be satisfied. In that case,
-    or when ``max_registration_bytes`` is given, the tensor is backed by an
-    anonymous mapping that CUDA registers in page-aligned chunks. Kernels can
-    read and write it through a UVA view, but a CUDA memcpy whose host range
-    spans two chunks fails, so such a tensor is for UVA access only.
+    kmalloc a folio array per long-term pin: pinning 2 GiB or more in one call
+    fails with ``invalid argument``, and that failure leaks the pages it had
+    already pinned until reboot. Buffers above ``max_registration_bytes`` are
+    therefore never pinned in one call. They are backed by an anonymous mapping
+    that CUDA registers in page-aligned chunks; kernels can read and write it
+    through a UVA view, but a CUDA memcpy whose host range spans two chunks
+    fails, so such a tensor is for UVA access only.
 
     Args:
         size: Shape of the tensor.
         dtype: Element type of the tensor.
-        max_registration_bytes: Register in chunks of at most this many bytes
-            instead of trying one pinned allocation first.
+        max_registration_bytes: Largest size passed to one
+            ``cudaHostRegister`` call; larger buffers are registered in chunks.
 
     Returns:
         A contiguous, pinned CPU tensor.
@@ -950,18 +950,7 @@ def empty_pinned_cpu(
     if max_registration_bytes is None:
         # 64 MiB keeps the kernel's per-pin folio array at 128 KiB.
         max_registration_bytes = 64 << 20
-        try:
-            return torch.empty(size, dtype=dtype, device="cpu", pin_memory=True)
-        except RuntimeError:
-            if not current_platform.is_cuda() or num_bytes <= max_registration_bytes:
-                raise
-        logger.warning(
-            "Pinning %d bytes in one call failed; registering it in chunks of "
-            "%d bytes. CUDA copies that span chunks are unsupported.",
-            num_bytes,
-            max_registration_bytes,
-        )
-    if num_bytes <= max_registration_bytes:
+    if num_bytes <= max_registration_bytes or not current_platform.is_cuda():
         return torch.empty(size, dtype=dtype, device="cpu", pin_memory=True)
 
     chunk_bytes = max(
