@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import mmap
+
 import numpy as np
 import pytest
 import torch
 
 from vllm.utils.platform_utils import is_uva_available
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.utils.torch_utils import (
+    empty_pinned_cpu,
+    get_accelerator_view_from_cpu_tensor,
+)
 from vllm.v1.worker.gpu import buffer_utils
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
@@ -56,6 +61,24 @@ def test_gpu_write(device):
     assert cpu_tensor[0, 0] == 2
     assert cpu_tensor[2, 3] == 4
     assert cpu_tensor[4, 5] == -2
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_chunk_registered_pinned_tensor_reads_across_chunks(device):
+    """A buffer pinned in several registrations reads back through one UVA view."""
+    torch.set_default_device(device)
+    # Odd-width rows straddle every chunk boundary.
+    cpu_tensor = empty_pinned_cpu(
+        (1024, 257), torch.uint8, max_registration_bytes=16 * mmap.PAGESIZE
+    )
+    assert cpu_tensor.is_pinned()
+    cpu_tensor.copy_(
+        torch.randint(0, 256, cpu_tensor.shape, dtype=torch.uint8, device="cpu")
+    )
+
+    cuda_view = get_accelerator_view_from_cpu_tensor(cpu_tensor)
+    assert torch.equal(cuda_view.to(torch.int16).cpu(), cpu_tensor.to(torch.int16))
 
 
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
