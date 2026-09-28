@@ -922,8 +922,10 @@ def empty_pinned_cpu(
 ) -> torch.Tensor:
     """Allocate an uninitialized pinned CPU tensor, even beyond a pinning cap.
 
-    Some kernels cap how much memory one pinning call may lock, so a large
-    ``pin_memory=True`` allocation fails with ``invalid argument``. In that case,
+    Linux kernels with commit 53ba78de064b but without its fix 94efde1d1539
+    kmalloc a folio array per long-term pin, so pinning 2 GiB or more in one
+    call fails with ``invalid argument``, and large chunks can still fail when
+    that order-N allocation cannot be satisfied. In that case,
     or when ``max_registration_bytes`` is given, the tensor is backed by an
     anonymous mapping that CUDA registers in page-aligned chunks. Kernels can
     read and write it through a UVA view, but a CUDA memcpy whose host range
@@ -946,7 +948,8 @@ def empty_pinned_cpu(
 
     num_bytes = math.prod(size) * dtype.itemsize
     if max_registration_bytes is None:
-        max_registration_bytes = 1 << 30
+        # 64 MiB keeps the kernel's per-pin folio array at 128 KiB.
+        max_registration_bytes = 64 << 20
         try:
             return torch.empty(size, dtype=dtype, device="cpu", pin_memory=True)
         except RuntimeError:
