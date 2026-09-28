@@ -976,7 +976,8 @@ def empty_pinned_cpu(
             _unregister_host_chunks(mapping, registered)
             raise RuntimeError(
                 f"cudaHostRegister of {length} bytes at offset {offset} of a "
-                f"{num_bytes}-byte pinned buffer failed: {result}"
+                f"{num_bytes}-byte pinned buffer failed with CUDA error "
+                f"{result.value} ({result})"
             )
         registered.append(base + offset)
     # Tensor views retain `owner`; its finalizer unregisters before unmapping.
