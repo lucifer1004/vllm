@@ -1060,6 +1060,71 @@ def test_stop_string(
     assert not output_processor.has_unfinished_requests()
 
 
+@pytest.mark.parametrize("reasoning_ended", [False, True, None])
+def test_stop_string_after_reasoning(reasoning_ended: bool | None, dummy_test_vectors):
+    """A stop string inside the reasoning must not end a request that starts
+    in reasoning; reasoning_ended True or None keeps matching everywhere."""
+    tokenizer = dummy_test_vectors.tokenizer
+
+    def encode(text: str) -> list[int]:
+        return tokenizer(text, add_special_tokens=False).input_ids
+
+    reasoning = encode(" Recall the Question: 2 + 2.")
+    end = encode(" Done")
+    answer = encode(" It is 4. Question: next")
+    end_token_id = end[-1]
+    assert end_token_id not in reasoning
+
+    reasoner = Mock()
+    reasoner.is_reasoning_end_streaming.side_effect = (
+        lambda ids, delta: end_token_id in delta
+    )
+    reasoning_parser_cls = Mock(return_value=reasoner)
+    output_processor = OutputProcessor(
+        tokenizer, log_stats=False, reasoning_parser_cls=reasoning_parser_cls
+    )
+    prompt = dummy_test_vectors.prompt_tokens[0]
+    output_processor.add_request(
+        EngineCoreRequest(
+            request_id="request-0-int",
+            external_req_id="request-0",
+            prompt_token_ids=prompt,
+            mm_features=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            sampling_params=SamplingParams(
+                output_kind=RequestOutputKind.FINAL_ONLY, stop=["Question:"]
+            ),
+            pooling_params=None,
+            reasoning_ended=reasoning_ended,
+        ),
+        None,
+    )
+    engine_core = MockEngineCore(
+        tokens_list=[reasoning + end + answer],
+        prompts_list=[prompt],
+        request_ids=["request-0-int"],
+    )
+    text = None
+    while outputs := engine_core.get_outputs():
+        for request_output in output_processor.process_outputs(outputs).request_outputs:
+            text = request_output.outputs[0].text
+        if text is not None:
+            break
+
+    assert text is not None
+    if reasoning_ended is False:
+        # Stopped at the answer's "Question:", keeping the reasoning's.
+        assert text.count("Question:") == 1
+        assert text.rstrip().endswith("It is 4.")
+    else:
+        assert "Question:" not in text
+        assert text.rstrip().endswith("Recall the")
+    assert reasoning_parser_cls.called == (reasoning_ended is False)
+
+
 def test_iteration_stats(dummy_test_vectors):
     output_processor = OutputProcessor(dummy_test_vectors.tokenizer, log_stats=True)
     engine_core_timestamp = time.monotonic()

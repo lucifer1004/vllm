@@ -42,6 +42,8 @@ from vllm.v1.metrics.stats import (
 from vllm.v1.outputs import SamplingMaskLists
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.reasoning import ReasoningParser
     from vllm.v1.engine.admission_control import SharedAdmissionStats
 
 # shared empty CPU tensor used as a placeholder pooling output
@@ -230,6 +232,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        reasoning_parser_cls: "type[ReasoningParser] | None" = None,
     ) -> "RequestState":
         remote_prefill_cached_tokens = None
         if sampling_params := request.sampling_params:
@@ -256,6 +259,7 @@ class RequestState:
             detokenizer = IncrementalDetokenizer.from_new_request(
                 tokenizer=tokenizer,
                 request=request,
+                reasoning_parser_cls=reasoning_parser_cls,
             )
             max_tokens_param = sampling_params.max_tokens
             top_p = sampling_params.top_p
@@ -461,6 +465,20 @@ class RequestState:
         return PoolingOutput(data=pooling_output)
 
 
+def reasoning_parser_cls_from_config(
+    vllm_config: "VllmConfig",
+) -> "type[ReasoningParser] | None":
+    """The `--reasoning-parser` class, as the structured-output manager loads it."""
+    config = vllm_config.structured_outputs_config
+    if not config.reasoning_parser or vllm_config.model_config.skip_tokenizer_init:
+        return None
+    from vllm.reasoning import ReasoningParserManager
+
+    if config.reasoning_parser_plugin and len(config.reasoning_parser_plugin) > 3:
+        ReasoningParserManager.import_reasoning_parser(config.reasoning_parser_plugin)
+    return ReasoningParserManager.get_reasoning_parser(config.reasoning_parser)
+
+
 class OutputProcessor:
     """Process EngineCoreOutputs into RequestOutputs."""
 
@@ -472,9 +490,11 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
+        reasoning_parser_cls: "type[ReasoningParser] | None" = None,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
+        self.reasoning_parser_cls = reasoning_parser_cls
         self.stream_interval = stream_interval
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
@@ -596,6 +616,7 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            reasoning_parser_cls=self.reasoning_parser_cls,
         )
         self.request_states[request_id] = req_state
         if parent_req:
