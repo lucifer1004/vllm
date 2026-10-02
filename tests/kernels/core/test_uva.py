@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import mmap
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,6 +13,7 @@ from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
     empty_pinned_cpu,
     get_accelerator_view_from_cpu_tensor,
+    register_host_mapping,
 )
 from vllm.v1.worker.gpu import buffer_utils
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
@@ -82,6 +85,54 @@ def test_chunk_registered_pinned_tensor_reads_across_chunks(device):
 
     cuda_view = get_accelerator_view_from_cpu_tensor(cpu_tensor)
     assert torch.equal(cuda_view.to(torch.int16).cpu(), cpu_tensor.to(torch.int16))
+
+
+@pytest.mark.parametrize("fail_at", [None, 0, 2])
+def test_register_host_mapping_chunks_and_releases(monkeypatch, fail_at):
+    """No call registers more than the cap, and every chunk is released once:
+    by a failed registration, or when the last view of the tensor is freed."""
+    registered: list[int] = []
+    sizes: list[int] = []
+    unregistered: list[int] = []
+
+    def register(pointer, size, flags):
+        if len(registered) == fail_at:
+            return SimpleNamespace(value=1)
+        registered.append(pointer)
+        sizes.append(size)
+        return SimpleNamespace(value=0)
+
+    def unregister(pointer):
+        unregistered.append(pointer)
+        return SimpleNamespace(value=0)
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "cudart",
+        lambda: SimpleNamespace(
+            cudaHostRegister=register, cudaHostUnregister=unregister
+        ),
+    )
+    mapping = mmap.mmap(-1, 4 * mmap.PAGESIZE + 1)
+    if fail_at is not None:
+        with pytest.raises(RuntimeError, match="cudaHostRegister of"):
+            register_host_mapping(mapping, max_registration_bytes=mmap.PAGESIZE)
+        assert unregistered == registered and len(registered) == fail_at
+        return
+
+    tensor = register_host_mapping(mapping, max_registration_bytes=mmap.PAGESIZE)
+    assert tensor.dtype == torch.uint8 and tensor.numel() == len(mapping)
+    assert sizes == [mmap.PAGESIZE] * 4 + [1]
+    assert registered == [
+        tensor.data_ptr() + i * mmap.PAGESIZE for i in range(len(sizes))
+    ]
+    view = tensor[1:]
+    del tensor
+    gc.collect()
+    assert not unregistered
+    del view
+    gc.collect()
+    assert unregistered == registered
 
 
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
