@@ -12,6 +12,7 @@ With shared host storage, DP replicas instead map the same TP slice and
 prefetch only their own tokens without DP gathers.
 """
 
+import mmap
 from itertools import product
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -48,6 +49,7 @@ from vllm.models.deepseek_v41.common.engram import (
     gather_engram_hashes,
 )
 from vllm.platforms import current_platform
+from vllm.utils import torch_utils
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.system_utils import update_environment_variables
 
@@ -218,7 +220,8 @@ def _check_shared_storage_lifetime_and_failures(failure):
     runtime = torch.cuda.cudart()
     make_file = engram_ops.tempfile.NamedTemporaryFile
     map_file = engram_ops.mmap.mmap
-    paths, mappings, registrations, unregistrations = [], [], [], []
+    paths, mappings, unregistrations = [], [], []
+    registrations: list[int] = []
     failed_rank = 0 if failure == "create" else 1
 
     def fail():
@@ -244,7 +247,12 @@ def _check_shared_storage_lifetime_and_failures(failure):
         return result
 
     def register(pointer, size, flags):
-        if failure == "register" and group.rank_in_group == failed_rank:
+        # Fail a later chunk, so the chunks before it must be rolled back.
+        if (
+            failure == "register"
+            and group.rank_in_group == failed_rank
+            and registrations
+        ):
             return SimpleNamespace(value=1)
         result = runtime.cudaHostRegister(pointer, size, flags)
         assert result.value == 0
@@ -258,6 +266,8 @@ def _check_shared_storage_lifetime_and_failures(failure):
         return result
 
     with pytest.MonkeyPatch.context() as patch:
+        # Register the shared mapping in several chunks.
+        patch.setattr(torch_utils, "_MAX_HOST_REGISTRATION_BYTES", mmap.PAGESIZE)
         patch.setattr(
             engram_ops,
             "tempfile",
@@ -286,6 +296,7 @@ def _check_shared_storage_lifetime_and_failures(failure):
             assert unregistrations == registrations
         else:
             storage = engram_ops.DPSharedEngramStorage(128, DIM, BLOCK, group)
+            assert len(registrations) > 1
             assert all(not path.exists() for path in paths)
             storage_ref = weakref.ref(storage)
             parameter = torch.nn.Parameter(storage.weight, requires_grad=False)
