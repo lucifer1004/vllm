@@ -74,3 +74,16 @@ def test_no_match_and_empty_inputs_return_none():
     assert check_stop_strings("hello", 5, ["zzz"], include_in_output=False) is None
     assert check_stop_strings("hello", 0, ["h"], include_in_output=False) is None
     assert check_stop_strings("hello", 5, [], include_in_output=False) is None
+
+
+def test_match_before_min_start_is_ignored():
+    # "Q:" appears in the reasoning (index 0) and in the answer (index 13);
+    # only the answer, from index 8 on, may stop the request.
+    text = "Q: think. A. Q: more"
+    assert check_stop_strings(
+        text, len(text), ["Q:"], include_in_output=False, min_start=8
+    ) == ("Q:", 13)
+    assert (
+        check_stop_strings(text[:10], 10, ["Q:"], include_in_output=False, min_start=8)
+        is None
+    )
