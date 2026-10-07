@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import bisect
 import inspect
+import mmap
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from vllm.models.deepseek_v41.common.engram import (
     ParallelEngramEmbedding,
 )
 from vllm.platforms import current_platform
+from vllm.utils import torch_utils
 
 
 def _reference_engram_post_wkv(
@@ -764,6 +766,50 @@ def test_engram_use_thp_lookup_and_fallback(monkeypatch, register_fails):
     expected = torch.zeros_like(out)
     expected[:2] = 2
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("use_thp", [False, True])
+def test_engram_offload_never_pins_in_one_call(monkeypatch, use_thp):
+    """Offloaded tables above the per-call cap are registered in chunks, and
+    lookups read rows across chunk boundaries exactly."""
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
+    cap = 16 * mmap.PAGESIZE
+    monkeypatch.setattr(torch_utils, "_MAX_HOST_REGISTRATION_BYTES", cap)
+    runtime = torch.cuda.cudart()
+    register = runtime.cudaHostRegister
+    sizes = []
+
+    def counting_register(pointer, size, flags):
+        sizes.append(size)
+        return register(pointer, size, flags)
+
+    monkeypatch.setattr(runtime, "cudaHostRegister", counting_register)
+    rows, dim = 32769, 64
+    with torch.device("cuda"):
+        layer = ParallelEngramEmbedding(
+            rows, dim, (rows,), cpu_offload=True, use_thp=use_thp
+        )
+    assert layer.weight.is_pinned() and layer.weight_scale_inv.is_pinned()
+    assert len(sizes) > 1 and max(sizes) <= cap
+    torch.manual_seed(0)
+    layer.weight.data.copy_((torch.randn(rows, dim) * 4).to(torch.float8_e4m3fn))
+    layer.weight_scale_inv.data.copy_(
+        torch.randint(120, 134, layer.weight_scale_inv.shape, dtype=torch.uint8)
+    )
+    ids = torch.randint(0, rows, (256, 1), dtype=torch.int32, device="cuda")
+    # Clone first: a CUDA copy spanning registration chunks is unsupported.
+    expected = _reference_lookup(
+        layer.weight.data.clone().cuda(),
+        layer.weight_scale_inv.data.clone().cuda(),
+        ids,
+        0,
+        rows,
+    )
+    out = torch.empty(256, 1, dim, device="cuda", dtype=torch.bfloat16)
+    layer.lookup(ids, out)
+    assert torch.equal(out, expected)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")

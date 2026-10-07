@@ -46,7 +46,10 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.utils.torch_utils import (
+    empty_pinned_cpu,
+    get_accelerator_view_from_cpu_tensor,
+)
 
 from .ple import PLEVocabParallelEmbedding
 
@@ -453,13 +456,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """Allocate the complete PLE weight directly in pinned CPU memory."""
-        return torch.empty(
-            num_embeddings,
-            embedding_dim,
-            dtype=dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        return empty_pinned_cpu((num_embeddings, embedding_dim), dtype)
 
     def _lookup(
         self,
