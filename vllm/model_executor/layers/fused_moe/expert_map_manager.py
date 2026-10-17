@@ -359,13 +359,6 @@ class ExpertMapManager:
             return True
         return self._expert_map[global_id] != -1
 
-    def get_local_expert_ids(self) -> list[int]:
-        """Get list of global IDs for experts on this rank."""
-        if self._expert_map is None:
-            return list(range(self.global_num_experts))
-
-        return torch.where(self._expert_map != -1)[0].tolist()
-
     def update(
         self,
         moe_parallel_config: FusedMoEParallelConfig,
@@ -405,6 +398,9 @@ class ExpertMapManager:
         """
         if self._expert_map is None:
             return f"[0..{self.global_num_experts - 1}]"
+        if self._expert_map.is_meta:
+            # Built on the meta device (simulated execution): no values.
+            return f"{self.local_num_experts} local experts"
 
         global_indices = torch.where(self._expert_map != -1)[0]
         local_indices = self._expert_map[global_indices]

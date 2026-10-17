@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Worker for simulated forward: no weights, no KV tensors, no forward pass."""
+"""Worker for simulated execution: no weights, no KV tensors, no forward."""
 
 # ruff: noqa: E402
-import os
-
 import torch
 
 from vllm.platforms import current_platform
 
 if current_platform.is_cpu():
-    # Turns torch's CUDA stream/event/pin_memory APIs into no-ops so the GPU
-    # model runner's buffers work on a CPU-only host. Must precede the GPU
-    # worker and runner imports, as in cpu_worker.py.
+    # Stubs torch's CUDA stream/event APIs for the GPU runner, as in
+    # cpu_worker.py; must precede its import.
     import vllm.v1.worker.cpu.shm  # noqa: F401
 
+from vllm.distributed.kv_transfer import kv_transfer_state
+from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.simulated.model_runner import SimulatedModelRunner
 from vllm.v1.worker.worker_base import CompilationTimes
@@ -26,37 +26,18 @@ logger = init_logger(__name__)
 
 
 class SimulatedWorker(Worker):
-    """Runs the V2 model runner's request bookkeeping while skipping weight
-    loading, KV-cache allocation and the forward pass.
+    """Worker for simulated execution: no weights, no KV tensors, no forward."""
 
-    On a CUDA-alike host the worker still binds a device: the runner keeps its
-    small request-state and block-table buffers there and uses the stock
-    Triton input-preparation kernels. On the CPU platform the same kernels run
-    through Triton's CPU backend. The model lives on the meta device either
-    way."""
+    _kv_connector: KVConnectorBaseType | None = None
 
     def init_device(self) -> None:
-        # Nothing to reduce across ranks; the custom all-reduce needs P2P probes.
-        self.parallel_config.disable_custom_all_reduce = True
-
         if current_platform.is_cuda_alike():
-            assert self.local_rank < torch.accelerator.device_count(), (
-                f"local rank {self.local_rank} is out of bounds for "
-                f"{torch.accelerator.device_count()} devices"
-            )
-            visible = current_platform.logical_device_id_to_visible_device_id(
-                self.local_rank
-            )
-            self.device = torch.device(f"{current_platform.device_type}:{visible}")
-            torch.accelerator.set_device_index(self.device)
+            self._bind_device()
         else:
+            from vllm.v1.worker.cpu_worker import set_dist_ident
+
             self.device = torch.device("cpu")
-            init_method = self.distributed_init_method
-            os.environ["VLLM_DIST_IDENT"] = (
-                os.path.basename(init_method.removeprefix("file://"))
-                if init_method.startswith("file://")
-                else init_method.split(":")[-1]
-            )
+            set_dist_ident(self.distributed_init_method)
 
         init_worker_distributed_environment(
             self.vllm_config,
@@ -66,18 +47,42 @@ class SimulatedWorker(Worker):
             current_platform.dist_backend,
         )
         set_random_seed(self.model_config.seed)
-        logger.info("Simulated forward on %s", self.device)
+        logger.info(
+            "Simulated execution on %s (timing=%s)",
+            self.device,
+            self.vllm_config.simulation_config.timing,
+        )
         self._init_workspace_and_model_runner()
+
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        # Engines simulated in one process (disaggregated instances) each
+        # build their own connector, which is a process global.
+        kv_transfer_state.set_kv_transfer_group(None)
+        super().initialize_from_config(kv_cache_config)
+        if kv_transfer_state.has_kv_transfer_group():
+            self._kv_connector = kv_transfer_state.get_kv_transfer_group()
+
+    def shutdown(self) -> None:
+        # Shut down this engine's connector, not the last one built.
+        kv_transfer_state.set_kv_transfer_group(self._kv_connector)
+        super().shutdown()
+
+    def execute_model(self, scheduler_output):  # type: ignore[override]
+        """No hidden states flow between pipeline stages: every stage runs
+        its own bookkeeping and timing from the same scheduler output."""
+        with self.annotate_profile(scheduler_output):
+            return self.model_runner.execute_model(scheduler_output)
 
     def _make_model_runner(self) -> SimulatedModelRunner:  # type: ignore[override]
         return SimulatedModelRunner(self.vllm_config, self.device)
 
     def determine_available_memory(self) -> int:
-        """Virtual KV capacity: nothing is profiled. The KV cache is sized from
+        """Virtual KV capacity. Nothing is profiled: the KV cache is sized from
         `kv_cache_memory_bytes`, or from the device's total memory and
         `gpu_memory_utilization` when that is unset."""
         kv_bytes = self.cache_config.kv_cache_memory_bytes
         if kv_bytes is None:
+            assert self.device is not None
             if self.device.type == "cpu":
                 import psutil
 
@@ -97,13 +102,15 @@ class SimulatedWorker(Worker):
         return kv_bytes
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        assert isinstance(self.model_runner, SimulatedModelRunner)
+        self.model_runner.warm_up_step_kernels()
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
 
     def sleep(self, level: int = 1) -> None:
-        logger.warning("Sleep mode is a no-op under simulated forward.")
+        logger.warning("Sleep mode is a no-op under simulated execution.")
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        logger.warning("Wake-up is a no-op under simulated forward.")
+        logger.warning("Wake-up is a no-op under simulated execution.")

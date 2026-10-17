@@ -64,6 +64,7 @@ from vllm.config import (
     ProfilerConfig,
     ReasoningConfig,
     SchedulerConfig,
+    SimulationConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
     UVAOffloadConfig,
@@ -182,6 +183,11 @@ def union_dict_and_str(val: str) -> str | dict[str, str] | None:
     if not re.match(r"(?s)^\s*{.*}\s*$", val):
         return str(val)
     return optional_type(json.loads)(val)
+
+
+def parse_reasoning_parser(val: str) -> str:
+    """Map `none` (any case) to the unset default, as `vllm-rs serve` does."""
+    return "" if val.lower() == "none" else val
 
 
 def is_type(type_hint: TypeHint, type: TypeHintT) -> TypeIs[TypeHintT]:
@@ -453,6 +459,12 @@ _LOG_CONFIG_FILE_DEPRECATION_MESSAGE = (
 )
 
 
+_MAMBA_CACHE_MODE_DEPRECATION_MESSAGE = (
+    "--mamba-cache-mode is deprecated and will be removed in v0.33.0. "
+    "It has no effect: Mamba prefix caching follows --enable-prefix-caching."
+)
+
+
 _DISABLE_CASCADE_ATTN_DEPRECATION_MESSAGE = (
     "--disable-cascade-attn is deprecated and has no effect since cascade "
     "attention has been removed. It will be removed in v0.33.0."
@@ -595,7 +607,7 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
-    simulate_forward: bool = CacheConfig.simulate_forward
+    simulate_forward: bool = SimulationConfig.simulate_forward
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
@@ -709,6 +721,7 @@ class EngineArgs:
         VllmConfig, "structured_outputs_config"
     )
     aux_output_config: AuxOutputConfig = get_field(VllmConfig, "aux_output_config")
+    simulation_config: SimulationConfig = get_field(VllmConfig, "simulation_config")
     reasoning_parser: str = StructuredOutputsConfig.reasoning_parser
     reasoning_parser_plugin: str | None = None
 
@@ -799,7 +812,7 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
-    mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
+    mamba_cache_mode: MambaCacheMode | None = None
     enable_mamba_shared_prefix_checkpoint: bool = (
         CacheConfig.enable_mamba_shared_prefix_checkpoint
     )
@@ -869,6 +882,11 @@ class EngineArgs:
             self.aux_output_config = AuxOutputConfig(**self.aux_output_config)
         if self.enable_return_routed_experts:
             self.aux_output_config.enable_return_routed_experts = True
+        if isinstance(self.simulation_config, dict):
+            self.simulation_config = SimulationConfig(**self.simulation_config)
+        if self.simulate_forward:
+            self.simulation_config.simulate_forward = True
+        self.simulate_forward = self.simulation_config.simulate_forward
         if isinstance(self.engram_config, dict):
             self.engram_config = EngramConfig(**self.engram_config)
         if isinstance(self.mamba_config, dict):
@@ -938,6 +956,7 @@ class EngineArgs:
         # Model arguments
         model_kwargs = get_kwargs(ModelConfig)
         aux_output_kwargs = get_kwargs(AuxOutputConfig)
+        simulation_kwargs = get_kwargs(SimulationConfig)
         model_group = parser.add_argument_group(
             title="ModelConfig",
             description=ModelConfig.__doc__,
@@ -1109,6 +1128,10 @@ class EngineArgs:
 
         # Structured outputs arguments
         structured_outputs_kwargs = get_kwargs(StructuredOutputsConfig)
+        structured_outputs_kwargs["reasoning_parser"]["type"] = parse_reasoning_parser
+        structured_outputs_kwargs["reasoning_parser"]["help"] += (
+            "\n\n`none` disables reasoning parsing, the same as leaving it unset."
+        )
         structured_outputs_group = parser.add_argument_group(
             title="StructuredOutputsConfig",
             description=StructuredOutputsConfig.__doc__,
@@ -1364,9 +1387,6 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
-        cache_group.add_argument(
-            "--simulate-forward", **cache_kwargs["simulate_forward"]
-        )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
@@ -1407,7 +1427,12 @@ class EngineArgs:
             "--prefix-match-unit", **cache_kwargs["prefix_match_unit"]
         )
         cache_group.add_argument(
-            "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
+            "--mamba-cache-mode",
+            **{
+                **cache_kwargs["mamba_cache_mode"],
+                "default": None,
+                "help": _MAMBA_CACHE_MODE_DEPRECATION_MESSAGE,
+            },
         )
         cache_group.add_argument(
             "--enable-mamba-shared-prefix-checkpoint",
@@ -1873,6 +1898,12 @@ class EngineArgs:
         vllm_group.add_argument(
             "--aux-output-config", **vllm_kwargs["aux_output_config"]
         )
+        vllm_group.add_argument(
+            "--simulation-config", **vllm_kwargs["simulation_config"]
+        )
+        vllm_group.add_argument(
+            "--simulate-forward", **simulation_kwargs["simulate_forward"]
+        )
         vllm_group.add_argument("--profiler-config", **vllm_kwargs["profiler_config"])
         vllm_group.add_argument(
             "--optimization-level", **vllm_kwargs["optimization_level"]
@@ -1958,17 +1989,6 @@ class EngineArgs:
         if self.disable_cascade_attn is not None:
             warnings.warn(_DISABLE_CASCADE_ATTN_DEPRECATION_MESSAGE, stacklevel=1)
 
-        hf_overrides = self.hf_overrides
-        quantization = self.quantization
-        quantization_config = self.quantization_config
-        if self.simulate_forward:
-            quantization = None
-            quantization_config = None
-            if not callable(hf_overrides):
-                # Simulated forward never loads weights; ignore checkpoint
-                # weight quantization while preserving attention/KV metadata.
-                hf_overrides = {**hf_overrides, "quantization_config": None}
-
         return ModelConfig(
             model=self.model,
             model_weights=self.model_weights,
@@ -1985,20 +2005,19 @@ class EngineArgs:
             revision=self.revision,
             code_revision=self.code_revision,
             hf_token=self.hf_token,
-            hf_overrides=hf_overrides,
+            hf_overrides=self.hf_overrides,
             model_class_overrides=self.model_class_overrides,
             tokenizer_revision=self.tokenizer_revision,
             max_model_len=self.max_model_len,
-            quantization=quantization,
-            quantization_config=quantization_config,
+            quantization=self.quantization,
+            quantization_config=self.quantization_config,
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             enforce_eager=self.enforce_eager,
             return_sampling_mask=self.return_sampling_mask,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
             use_fp64_gumbel=self.use_fp64_gumbel,
-            # Simulated forward emits output tokens only via trace replay.
-            enable_trace_replay=self.enable_trace_replay or self.simulate_forward,
+            enable_trace_replay=self.enable_trace_replay,
             disable_sliding_window=self.disable_sliding_window,
             skip_tokenizer_init=self.skip_tokenizer_init,
             enable_prompt_embeds=self.enable_prompt_embeds,
@@ -2279,12 +2298,13 @@ class EngineArgs:
         assert self.enable_prefix_caching is not None, (
             "enable_prefix_caching must be set by this point"
         )
+        if self.mamba_cache_mode is not None:
+            logger.warning_once(_MAMBA_CACHE_MODE_DEPRECATION_MESSAGE)
 
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
-            simulate_forward=self.simulate_forward,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
@@ -2299,7 +2319,6 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             prefix_match_unit=self.prefix_match_unit,
-            mamba_cache_mode=self.mamba_cache_mode,
             enable_mamba_shared_prefix_checkpoint=(
                 self.enable_mamba_shared_prefix_checkpoint
             ),
@@ -2633,7 +2652,6 @@ class EngineArgs:
         assert model_config.max_model_len is not None, (
             "max_model_len must be set by this point"
         )
-        async_scheduling = self.async_scheduling
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -2657,7 +2675,7 @@ class EngineArgs:
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
-            async_scheduling=async_scheduling,
+            async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
         )
 
@@ -2867,6 +2885,7 @@ class EngineArgs:
             offload_config=offload_config,
             attention_config=attention_config,
             aux_output_config=self.aux_output_config,
+            simulation_config=self.simulation_config,
             engram_config=self.engram_config,
             mamba_config=mamba_config,
             kernel_config=kernel_config,
@@ -2895,42 +2914,6 @@ class EngineArgs:
 
     def _check_feature_supported(self):
         """Raise an error if the feature is not supported."""
-        if self.simulate_forward:
-            if not (current_platform.is_cpu() or current_platform.is_cuda_alike()):
-                _raise_unsupported_error(
-                    feature_name="simulated forward on this platform"
-                )
-            if self.pipeline_parallel_size != 1:
-                _raise_unsupported_error(
-                    feature_name="simulated forward with pipeline parallelism"
-                )
-            if self.tensor_parallel_size != 1:
-                _raise_unsupported_error(
-                    feature_name="simulated forward with tensor parallelism"
-                )
-            if self.data_parallel_size != 1:
-                _raise_unsupported_error(
-                    feature_name="simulated forward with data parallelism"
-                )
-            if self.enable_lora:
-                _raise_unsupported_error(feature_name="simulated forward with LoRA")
-            if self.speculative_config is not None or self.spec_model is not None:
-                _raise_unsupported_error(
-                    feature_name="simulated forward with speculative decoding"
-                )
-            if self.kv_transfer_config is not None:
-                _raise_unsupported_error(
-                    feature_name="simulated forward with KV transfer"
-                )
-            if self.weight_transfer_config is not None:
-                _raise_unsupported_error(
-                    feature_name="simulated forward with weight transfer"
-                )
-            if self.runner not in ("auto", "generate"):
-                _raise_unsupported_error(
-                    feature_name="simulated forward for non-generation runners"
-                )
-
         if self.pipeline_parallel_size > 1:
             supports_pp = getattr(
                 self.distributed_executor_backend, "supports_pp", False
@@ -2970,10 +2953,14 @@ class EngineArgs:
         try:
             device_memory = current_platform.get_device_total_memory()
             device_name = current_platform.get_device_name().lower()
+            # GB10 (DGX Spark, cc 12.1) has the memory but not the compute of
+            # a large discrete GPU, keep it on the small tier.
+            is_gb10 = current_platform.is_device_capability((12, 1))
         except Exception:
             # This is only used to set default_max_num_batched_tokens
             device_memory = 0
             device_name = ""
+            is_gb10 = False
 
         # NOTE(Kuntai): Setting large `max_num_batched_tokens` for A100 reduces
         # throughput, see PR #17885 for more details.
@@ -2988,7 +2975,11 @@ class EngineArgs:
                 UsageContext.LLM_CLASS: 1024,
                 UsageContext.OPENAI_API_SERVER: 1024,
             }
-        elif device_memory >= 70 * GiB_bytes and "a100" not in device_name:
+        elif (
+            device_memory >= 70 * GiB_bytes
+            and "a100" not in device_name
+            and not is_gb10
+        ):
             # For GPUs like H100 and H200, use larger offline defaults.
             default_max_num_batched_tokens = {
                 UsageContext.LLM_CLASS: 16384,
@@ -3267,7 +3258,9 @@ class AsyncEngineArgs(EngineArgs):
             help="Enable logging request information, dependent on log level:\n"
             "- INFO: Request ID, parameters and LoRA request.\n"
             "- DEBUG: Prompt inputs (e.g: text, token IDs).\n"
-            "You can set the minimum log level via `VLLM_LOGGING_LEVEL`.",
+            "You can set the minimum log level via `VLLM_LOGGING_LEVEL`.\n"
+            "You can also set a separate log level for request JSON body "
+            "via `VLLM_REQUEST_BODY_LOG_LEVEL` (default: DEBUG).",
         )
         current_platform.pre_register_and_update(parser)
         return parser

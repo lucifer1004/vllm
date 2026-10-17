@@ -29,6 +29,15 @@ from vllm.v1.worker.worker_base import CompilationTimes
 logger = init_logger(__name__)
 
 
+def set_dist_ident(init_method: str) -> None:
+    """Name this deployment's CPU communicator from its init method."""
+    os.environ["VLLM_DIST_IDENT"] = (
+        os.path.basename(init_method.removeprefix("file://"))
+        if init_method.startswith("file://")
+        else init_method.split(":")[-1]
+    )
+
+
 class CPUWorker(Worker):
     def __init__(
         self,
@@ -144,12 +153,7 @@ class CPUWorker(Worker):
 
         torch.set_num_threads = skip_set_num_threads
 
-        init_method = self.distributed_init_method
-        os.environ["VLLM_DIST_IDENT"] = (
-            os.path.basename(init_method.removeprefix("file://"))
-            if init_method.startswith("file://")
-            else init_method.split(":")[-1]
-        )
+        set_dist_ident(self.distributed_init_method)
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config,
@@ -234,10 +238,24 @@ class CPUWorker(Worker):
         else:
             consumed_memory = psutil.Process(os.getpid()).memory_info().rss
             requested_memory_for_kv = int(self.requested_cpu_memory - consumed_memory)
-            if (
-                requested_memory_for_kv <= 0
-                or requested_memory_for_kv > available_memory
-            ):
+            if requested_memory_for_kv <= 0:
+                # The worker's own footprint already fills its reservation, so
+                # freeing memory elsewhere cannot help: only a larger
+                # reservation or an explicit KV cache size can.
+                in_use = math.ceil(consumed_memory / memory_status.total_memory * 100)
+                raise ValueError(
+                    f"The worker already uses {format_gib(consumed_memory)} GiB "
+                    "(model weights and runtime), more than the "
+                    f"{format_gib(self.requested_cpu_memory)} GiB of CPU memory "
+                    f"reserved for it on node {cpu_core.numa_node}, leaving none "
+                    "for the KV cache. On the CPU backend, the "
+                    "`--gpu-memory-utilization` flag controls the fraction of CPU "
+                    "memory reserved (despite its name). To resolve: increase "
+                    f"`--gpu-memory-utilization` to more than {in_use / 100:.2f}, "
+                    "or set the KV cache size explicitly with "
+                    "`--kv-cache-memory-bytes` or VLLM_CPU_KVCACHE_SPACE."
+                )
+            if requested_memory_for_kv > available_memory:
                 raise ValueError(
                     f"Available memory on node {cpu_core.numa_node} "
                     f"({format_gib(available_memory)}/"
