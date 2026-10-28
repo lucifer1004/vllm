@@ -528,11 +528,17 @@ class CudaGraphManager:
         num_active_loras: int,
         max_query_len: int | None = None,
         num_ubatches: int = 1,
+        assume_captured: bool = False,
     ) -> BatchExecutionDescriptor:
-        """Find matching cudagraph descriptor from priority-ordered candidates."""
+        """Find matching cudagraph descriptor from priority-ordered candidates.
+
+        `assume_captured` matches as if the graphs were captured, for a runner
+        that never captures them (simulated execution).
+        """
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
-        if self._graphs_captured and num_tokens > 0 and key in self._candidates:
+        captured = self._graphs_captured or assume_captured
+        if captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:
                 if _is_compatible(
                     desc,

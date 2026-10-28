@@ -82,6 +82,11 @@ class StepDescriptor:
     num_kv_tokens: int
     """Sum over scheduled requests of KV length after this step."""
     parallel: ParallelSummary = field(default_factory=ParallelSummary)
+    cudagraph_mode: str | None = None
+    """CUDA graph mode the step runs in (`FULL`, `PIECEWISE` or `NONE`), as the
+    runner dispatches it under Model Runner V2; None if not recorded."""
+    num_padded_tokens: int | None = None
+    """Tokens the step runs padded to for its CUDA graph."""
 
     @property
     def num_reqs(self) -> int:

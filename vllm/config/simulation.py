@@ -113,6 +113,8 @@ class SimulationConfig:
                 raise ValueError("record_step_timing needs a CUDA-alike platform.")
             if parallel.worker_cls == "auto":
                 parallel.worker_cls = _RECORDING_WORKER
+            # The recorder reads each step's CUDA graph mode from these.
+            vllm_config.observability_config.cudagraph_metrics = True
         if not self.simulate_forward:
             return
 

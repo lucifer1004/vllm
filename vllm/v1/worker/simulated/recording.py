@@ -5,7 +5,7 @@ format."""
 
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -250,6 +250,12 @@ class RecordingWorker(Worker):
         assert self._writer is not None
         _write_transfers(self._writer, output)
         record.num_accepted = _num_accepted(record.descriptor, output)
+        if (stats := output.cudagraph_stats) is not None:
+            record.descriptor = replace(
+                record.descriptor,
+                cudagraph_mode=stats.runtime_mode,
+                num_padded_tokens=stats.num_padded_tokens,
+            )
         record.resolved = True
         # Outputs are taken in step order: earlier steps still unresolved
         # (warmup steps, whose outputs are dropped) never will be.
