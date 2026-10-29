@@ -1313,6 +1313,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+    def dispatch_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_req_state: "BatchReqState | None",
+        dummy_run: bool,
+    ) -> tuple[int, int, int | None, int]:
+        """Request count, token count, max query length and active LoRA count
+        to dispatch the step's CUDA graph with."""
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_toks = scheduler_output.total_num_scheduled_tokens
+        max_query_len: int | None = max(scheduler_output.num_scheduled_tokens.values())
+        if batch_req_state is not None:
+            num_toks = batch_req_state.num_tokens
+            if batch_req_state.has_prefill:
+                # Varlen decode graphs replay decodes only, and their bound
+                # alone would admit a short prefill.
+                max_query_len = None
+            if self.pcp_manager is not None:
+                num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
+                    batch_req_state.num_scheduled_tokens,
+                    batch_req_state.is_prefilling_np,
+                )
+
+        num_active_loras = 0
+        if self.lora_config:
+            req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+            num_active_loras = get_num_active_loras_for_dispatch(
+                self.lora_config, self.lora_state, req_ids, dummy_run
+            )
+        return num_reqs, num_toks, max_query_len, num_active_loras
+
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
     ) -> tuple["BatchReqState | None", int | None]:
@@ -1783,30 +1814,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         # Get batch descriptor and sync across DP ranks.
-        num_reqs = len(scheduler_output.num_scheduled_tokens)
-        num_toks = scheduler_output.total_num_scheduled_tokens
-        max_query_len: int | None = max(scheduler_output.num_scheduled_tokens.values())
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
             scheduler_output, dummy_run
         )
-        if batch_req_state is not None:
-            num_toks = batch_req_state.num_tokens
-            if batch_req_state.has_prefill:
-                # Varlen decode graphs replay decodes only, and their bound
-                # alone would admit a short prefill.
-                max_query_len = None
-            if self.pcp_manager is not None:
-                num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
-                    batch_req_state.num_scheduled_tokens,
-                    batch_req_state.is_prefilling_np,
-                )
-
-        num_active_loras = 0
-        if self.lora_config:
-            req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-            num_active_loras = get_num_active_loras_for_dispatch(
-                self.lora_config, self.lora_state, req_ids, dummy_run
-            )
+        num_reqs, num_toks, max_query_len, num_active_loras = self.dispatch_inputs(
+            scheduler_output, batch_req_state, dummy_run
+        )
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:

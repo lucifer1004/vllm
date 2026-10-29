@@ -70,7 +70,9 @@ its startup log reports it: prefix-cache hit rates and preemption depend on it.
 A provider receives a `StepDescriptor`: per request, the tokens scheduled in
 the step, the KV length before it, the prompt length, prefix-cache hits at
 admission, draft tokens and whether it is prefilling; plus batch totals,
-common-prefix blocks and the parallel configuration. It returns a `StepCost`.
+common-prefix blocks, the parallel configuration and, under Model Runner V2,
+the CUDA graph mode and padded token count the runner dispatches the step
+with. It returns a `StepCost`.
 
 `table` and `replay` read a recorded step log (see below). A `table` can also
 be written by hand, as JSONL records of

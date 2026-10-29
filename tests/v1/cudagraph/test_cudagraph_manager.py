@@ -454,6 +454,32 @@ def test_varlen_decode_graph_takes_bounded_decode_batches_only(monkeypatch):
     assert dispatch(_DECODE_QUERY_LEN + 1).cg_mode == CUDAGraphMode.PIECEWISE
 
 
+def test_assume_captured_dispatches_as_captured(monkeypatch):
+    """Simulated execution never captures graphs but must report the graph the
+    real runner replays."""
+    manager = _make_spec_decode_manager(monkeypatch, varlen_decode=True)
+    batches = [
+        dict(num_reqs=4, num_tokens=12, uniform_token_count=_DECODE_QUERY_LEN),
+        dict(num_reqs=2, num_tokens=12, uniform_token_count=None),
+        dict(
+            num_reqs=3,
+            num_tokens=6,
+            uniform_token_count=None,
+            max_query_len=_DECODE_QUERY_LEN,
+        ),
+    ]
+    dispatched = [manager.dispatch(**b, num_active_loras=0) for b in batches]
+
+    manager._graphs_captured = False
+    assert all(
+        manager.dispatch(**b, num_active_loras=0).cg_mode == CUDAGraphMode.NONE
+        for b in batches
+    )
+    assert [
+        manager.dispatch(**b, num_active_loras=0, assume_captured=True) for b in batches
+    ] == dispatched
+
+
 def test_mixed_batch_at_decode_only_token_count_still_gets_a_graph(monkeypatch):
     """A mixed batch must not fall to eager where only decode graphs are staged.
 

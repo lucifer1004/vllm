@@ -246,7 +246,9 @@ class SimulatedModelRunner(GPUModelRunner):
             self._skip_to_transfer()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_output)
 
-        batch_req_state, _ = self.gather_batch_req_state(scheduler_output, dummy_run)
+        batch_req_state, uniform_tok_count = self.gather_batch_req_state(
+            scheduler_output, dummy_run
+        )
         assert batch_req_state is not None
         input_batch = self.prepare_inputs(
             scheduler_output,
@@ -265,6 +267,23 @@ class SimulatedModelRunner(GPUModelRunner):
         descriptor = build_step_descriptor(
             scheduler_output, self._prompt_lens, self._step_index, self._parallel
         )
+        if self.cudagraph_manager is not None:
+            num_reqs, num_toks, max_query_len, num_active_loras = self.dispatch_inputs(
+                scheduler_output, batch_req_state, dummy_run
+            )
+            batch_desc = self.cudagraph_manager.dispatch(
+                num_reqs,
+                num_toks,
+                uniform_tok_count,
+                num_active_loras,
+                max_query_len=max_query_len,
+                assume_captured=True,
+            )
+            descriptor = dataclasses.replace(
+                descriptor,
+                cudagraph_mode=batch_desc.cg_mode.name,
+                num_padded_tokens=batch_desc.num_tokens,
+            )
         descriptor, now = self._dp_joint_step(descriptor, t_entry)
         cost = self._estimate(descriptor)
         # Queue the step behind whatever the device is still "executing". It
