@@ -3,6 +3,8 @@
 import sys
 from abc import ABC, abstractmethod
 from bisect import bisect_left
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import tokenizers.decoders
 from tokenizers import Tokenizer
@@ -17,6 +19,9 @@ from vllm.tokenizers.detokenizer_utils import (
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import gc_untrack, untracked_list
 from vllm.v1.engine import EngineCoreRequest
+
+if TYPE_CHECKING:
+    from vllm.reasoning import ReasoningParser
 
 logger = init_logger(__name__)
 
@@ -53,6 +58,7 @@ class IncrementalDetokenizer:
         cls,
         tokenizer: TokenizerLike | None,
         request: EngineCoreRequest,
+        reasoning_parser_cls: "type[ReasoningParser] | None" = None,
     ) -> "IncrementalDetokenizer":
         assert request.sampling_params is not None
 
@@ -60,12 +66,28 @@ class IncrementalDetokenizer:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
 
+        detokenizer: BaseIncrementalDetokenizer
         if uses_fast_detokenizer(tokenizer):
             # Fast tokenizer => use tokenizers library DecodeStream.
-            return FastIncrementalDetokenizer(tokenizer, request)
+            detokenizer = FastIncrementalDetokenizer(tokenizer, request)
+        else:
+            # Fall back to slow python-based incremental detokenization.
+            detokenizer = SlowIncrementalDetokenizer(tokenizer, request)
 
-        # Fall back to slow python-based incremental detokenization.
-        return SlowIncrementalDetokenizer(tokenizer, request)
+        # Stop strings end the response, not the reasoning: a request that
+        # starts inside reasoning matches them only after reasoning ends.
+        if (
+            detokenizer.stop
+            and reasoning_parser_cls is not None
+            and request.reasoning_ended is False
+        ):
+            reasoner = reasoning_parser_cls(
+                tokenizer, **(request.reasoning_parser_kwargs or {})
+            )
+            detokenizer.defer_stop_until_reasoning_ends(
+                reasoner, request.prompt_token_ids or []
+            )
+        return detokenizer
 
 
 class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
@@ -92,8 +114,41 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self.stop_buffer_length = 0
         self._last_output_text_offset: int = 0
 
+        # Stop strings match only at or after this output text offset; None
+        # while the request is still reasoning.
+        self._stop_search_start: int | None = 0
+        self._reasoner: ReasoningParser | None = None
+        self._reasoning_end_token_ids: frozenset[int] | None = None
+        self._reasoning_token_ids: list[int] = []
+
         # Generation data
         self.output_text = ""
+
+    def defer_stop_until_reasoning_ends(
+        self, reasoner: "ReasoningParser", prompt_token_ids: Sequence[int]
+    ) -> None:
+        """Ignore stop strings until `reasoner` sees the reasoning end."""
+        from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
+
+        self._stop_search_start = None
+        self._reasoner = reasoner
+        if (
+            isinstance(reasoner, ParserEngineReasoningAdapter)
+            and reasoner.reasoning_end_token_ids
+        ):
+            self._reasoning_end_token_ids = reasoner.reasoning_end_token_ids
+        else:
+            self._reasoning_token_ids = list(prompt_token_ids)
+
+    def _ends_reasoning(self, token_id: int) -> bool:
+        # Same end detection as the structured-output reasoning gate.
+        if self._reasoning_end_token_ids is not None:
+            return token_id in self._reasoning_end_token_ids
+        assert self._reasoner is not None
+        self._reasoning_token_ids.append(token_id)
+        return self._reasoner.is_reasoning_end_streaming(
+            self._reasoning_token_ids, (token_id,)
+        )
 
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
         """Update RequestState for the request_id by:
@@ -124,6 +179,10 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self.output_text += self.decode_next(new_token_id)
             if token_offsets is not None:
                 token_offsets.append(len(self.output_text))
+            if self._stop_search_start is None and self._ends_reasoning(new_token_id):
+                self._stop_search_start = len(self.output_text)
+                self._reasoner = None
+                self._reasoning_token_ids = []
 
         if skipped_stop_token_id is not None:
             # Cleanup after skipping detokenization.
@@ -133,14 +192,20 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # 2) Evaluate stop strings.
         stop_string = None
-        if token_offsets is not None and self.num_output_tokens() > self.min_tokens:
+        if (
+            token_offsets is not None
+            and self._stop_search_start is not None
+            and self.num_output_tokens() > self.min_tokens
+        ):
             # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
             stop_check_offset = token_offsets[max(self.min_tokens - num_prev_tokens, 0)]
             stop = check_stop_strings(
                 output_text=self.output_text,
-                new_char_count=len(self.output_text) - stop_check_offset,
+                new_char_count=len(self.output_text)
+                - max(stop_check_offset, self._stop_search_start),
                 stop=self.stop,
                 include_in_output=self.include_stop_str_in_output,
+                min_start=self._stop_search_start,
             )
             if stop is not None:
                 stop_string, truncate_to = stop
@@ -327,9 +392,10 @@ def check_stop_strings(
     new_char_count: int,
     stop: list[str],
     include_in_output: bool,
+    min_start: int = 0,
 ) -> tuple[str, int] | None:
     """Check if any stop strings are matched and truncate sequence
-    output text accordingly.
+    output text accordingly. A match must start at or after `min_start`.
 
     Returns tuple (stop_string, offset) if matched or else None.
 
@@ -352,7 +418,8 @@ def check_stop_strings(
     for stop_str in stop:
         stop_string_len = len(stop_str)
         # Avoid searching already-searched text.
-        stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)
+        search_start = len(output_text) + 1 - new_char_count - stop_string_len
+        stop_index = output_text.find(stop_str, max(search_start, min_start, 0))
         if stop_index == -1:
             continue
 
