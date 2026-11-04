@@ -78,7 +78,11 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.cpu_resource_utils import get_available_memory
 from vllm.utils.platform_utils import is_uva_available
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.utils.torch_utils import (
+    empty_pinned_cpu,
+    get_accelerator_view_from_cpu_tensor,
+    register_host_mapping,
+)
 
 logger = init_logger(__name__)
 
@@ -901,17 +905,12 @@ class DPSharedEngramStorage:
             stack.close()
             assert mapping is not None
 
-            owner = tensor = None
+            tensor = None
             try:
-                owner = np.frombuffer(mapping, dtype=np.uint8)
-                pointer = owner.ctypes.data
-                _allow_any_numa_node(pointer, num_bytes)
-                tensor = torch.from_numpy(owner)
-                result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-                if result.value != 0:
-                    raise RuntimeError(f"cudaHostRegister failed: {result}")
-                finalizer = weakref.finalize(owner, self._unregister, mapping, pointer)
-                finalizer.atexit = False  # type: ignore[misc]
+                _allow_any_numa_node(
+                    np.frombuffer(mapping, dtype=np.uint8).ctypes.data, num_bytes
+                )
+                tensor = register_host_mapping(mapping)
                 # The UVA helper otherwise allocates a private pinned copy.
                 if not tensor.is_pinned():
                     raise RuntimeError(
@@ -921,21 +920,13 @@ class DPSharedEngramStorage:
                 error = describe_error(exc)
 
             if failures := gather_errors(group, error):
-                # Dropping the owner runs the finalizer; the mapping then unmaps.
-                del tensor, owner, mapping
+                # Dropping the tensor unregisters it; the mapping then unmaps.
+                del tensor, mapping
                 raise RuntimeError(
                     "Engram shared-memory initialization failed: " + failures
                 )
             assert tensor is not None
             return tensor, get_accelerator_view_from_cpu_tensor(tensor)
-
-    @staticmethod
-    def _unregister(mapping: mmap.mmap, pointer: int) -> None:
-        # Torch storage retains the numpy owner, including through cached UVA views.
-        # Keep its mmap alive until CUDA has released the registration.
-        result = torch.cuda.cudart().cudaHostUnregister(pointer)
-        if result.value != 0:
-            logger.warning("Engram cudaHostUnregister failed: %s", result)
 
     def load_weight(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
@@ -994,22 +985,13 @@ def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
         )
         return None
 
-    owner = np.frombuffer(mapping, dtype=np.uint8)
     # Fault the pages in before CUDA pins them, so they can be huge.
-    owner[:: mmap.PAGESIZE] = 0
-    tensor = torch.from_numpy(owner)
-    pointer = tensor.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-    if result.value != 0:
-        logger.warning(
-            "Engram cudaHostRegister failed (%s); using pinned memory.", result
-        )
+    np.frombuffer(mapping, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+    try:
+        tensor = register_host_mapping(mapping)
+    except RuntimeError as exc:
+        logger.warning("Engram %s; using pinned memory.", exc)
         return None
-    # Tensor views retain owner; its finalizer retains mapping until unregister.
-    finalizer = weakref.finalize(
-        owner, DPSharedEngramStorage._unregister, mapping, pointer
-    )
-    finalizer.atexit = False  # type: ignore[misc]
     if not tensor.is_pinned():
         logger.warning(
             "CUDA did not recognize Engram registration; using pinned memory."
@@ -1202,22 +1184,9 @@ class ParallelEngramEmbedding(nn.Module):
                     packed[:weight_bytes].view(torch.float8_e4m3fn).view(-1, self.dim),
                     packed[weight_bytes:].view(-1, scale_dim),
                 )
-        # Model initialization may be inside a CUDA device context.
         return (
-            torch.empty(
-                self.part_num_embeddings,
-                self.dim,
-                dtype=torch.float8_e4m3fn,
-                device="cpu",
-                pin_memory=True,
-            ),
-            torch.empty(
-                self.part_num_embeddings,
-                scale_dim,
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=True,
-            ),
+            empty_pinned_cpu((self.part_num_embeddings, self.dim), torch.float8_e4m3fn),
+            empty_pinned_cpu((self.part_num_embeddings, scale_dim), torch.uint8),
         )
 
     def collapse_huge_pages(self) -> None:
