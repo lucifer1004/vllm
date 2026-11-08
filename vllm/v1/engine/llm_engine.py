@@ -36,7 +36,10 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.input_processor import InputProcessor
-from vllm.v1.engine.output_processor import OutputProcessor
+from vllm.v1.engine.output_processor import (
+    OutputProcessor,
+    reasoning_parser_cls_from_config,
+)
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.kv_hints import KvHintsEnvelope
@@ -106,6 +109,7 @@ class LLMEngine:
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            reasoning_parser_cls=reasoning_parser_cls_from_config(self.vllm_config),
         )
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
