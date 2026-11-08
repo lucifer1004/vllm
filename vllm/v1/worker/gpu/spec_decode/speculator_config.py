@@ -184,7 +184,8 @@ class DraftModelSpeculatorConfig(SpeculatorConfig):
             return
 
         target = spec.target_model_config
-        # Callable target hf_overrides also apply to the draft; dict ones don't.
+        # Callable target hf_overrides and the rope-relevant keys of dict ones
+        # (YaRN / RoPE) also apply to the draft; other dict patches don't.
         draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
             target.hf_overrides, cls.transformers_backend_hf_overrides(spec)
         )
