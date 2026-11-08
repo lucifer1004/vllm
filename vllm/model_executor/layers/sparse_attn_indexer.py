@@ -33,6 +33,7 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 )
 from vllm.model_executor.kernels.attention.dsa.flashinfer_indexer import (
     FLASHINFER_INDEXER_MAX_NEXT_N,
+    flashinfer_decode_candidates_supported,
     flashinfer_indexer_decode,
     flashinfer_indexer_prefill,
     use_flashinfer_indexer,
@@ -617,6 +618,24 @@ def sparse_attn_indexer(
         full_context=not use_pcp and dcp_world_size == 1,
         candidate_selection=candidate_blocks is not None,
     )
+    # A v4.1 candidate layer's decode rows: the source publishes its blocks and
+    # the consumers rank within them in FlashInfer's kernel; prefill rows keep
+    # DeepGEMM.
+    flashinfer_decode = flashinfer_indexer or (
+        candidate_blocks is not None
+        and use_flashinfer_indexer(
+            query_shape=q_quant.shape[1:],
+            topk=topk_tokens,
+            fp4_cache=use_fp4_cache,
+            full_context=not use_pcp and dcp_world_size == 1,
+            candidate_selection=False,
+        )
+        and flashinfer_decode_candidates_supported(
+            num_candidates=candidate_blocks.shape[1],
+            block_size=candidate_block_size,
+            write=candidate_write,
+        )
+    )
 
     # DeepSelect ranks BF16 decode logits directly; other top-k backends and
     # the DCP merge read an FP32 copy.
@@ -1129,10 +1148,12 @@ def sparse_attn_indexer(
             else padded_q_quant_decode_tokens
         )
         if (
-            flashinfer_indexer
+            flashinfer_decode
             and next_n <= FLASHINFER_INDEXER_MAX_NEXT_N
             and seq_lens.numel() == num_padded_tokens
             and decode_metadata.global_seq_lens is None
+            # A consumer's candidate block lies within one cache block.
+            and (candidate_blocks is None or candidate_block_size <= kv_cache.shape[1])
         ):
             topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
             flashinfer_indexer_decode(
@@ -1142,6 +1163,13 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 topk_indices,
+                candidate_blocks=(
+                    candidate_blocks[:num_padded_tokens]
+                    if candidate_blocks is not None
+                    else None
+                ),
+                candidate_write=candidate_write,
+                candidate_block_size=candidate_block_size,
             )
             if needs_padded_path:
                 _unpack_decode_topk(

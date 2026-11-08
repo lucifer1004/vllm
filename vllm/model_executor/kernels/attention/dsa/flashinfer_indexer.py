@@ -10,6 +10,7 @@ without materializing the logits for prefill.
 
 import functools
 import importlib.util
+import inspect
 
 import torch
 
@@ -51,7 +52,8 @@ def use_flashinfer_indexer(
     query_shape: one token's indexer queries, (heads, head_dim);
     fp4_cache: the MXFP4 indexer cache keeps the DeepGEMM path;
     full_context: every rank ranks its rows over the whole context (no DCP or
-    PCP); candidate_selection: v4.1 two-level selection needs the logits.
+    PCP); candidate_selection: a v4.1 two-level selection layer, whose prefill
+    rows keep DeepGEMM (decode: flashinfer_decode_candidates_supported).
     Disabled with VLLM_USE_FUSED_MQA_TOPK=0, like the SM100 fused kernel.
     """
     heads, head_dim = tuple(query_shape)
@@ -64,6 +66,32 @@ def use_flashinfer_indexer(
         and head_dim == FLASHINFER_INDEXER_HEAD_DIM
         and 0 < topk <= FLASHINFER_INDEXER_MAX_TOPK
         and flashinfer_indexer_available()
+    )
+
+
+@functools.cache
+def _flashinfer_has_candidates() -> bool:
+    from flashinfer.dsa_indexer import dsa_indexer_det_topk
+
+    params = inspect.signature(dsa_indexer_det_topk).parameters
+    return "candidate_blocks" in params and "candidate_out" in params
+
+
+def flashinfer_decode_candidates_supported(
+    *, num_candidates: int, block_size: int, write: bool
+) -> bool:
+    """Whether FlashInfer's paged indexer runs a v4.1 candidate layer's decode
+    rows: the source (write) publishes its rows' top blocks with its own
+    top-k, a consumer ranks each row within its blocks. Its prefill rows keep
+    DeepGEMM: under decoder-side SWA replay they are a request's last rows."""
+    if not _flashinfer_has_candidates():
+        return False
+    if write:
+        return block_size in (8, 16) and 0 < num_candidates <= 4096
+    return (
+        8 <= block_size <= 128
+        and block_size & (block_size - 1) == 0
+        and 0 < num_candidates * block_size <= 16384
     )
 
 
@@ -127,6 +155,9 @@ def flashinfer_indexer_decode(
     context_lens: torch.Tensor,
     block_table: torch.Tensor,
     output: torch.Tensor,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_write: bool = False,
+    candidate_block_size: int = 8,
 ) -> None:
     """Fused replacement of ``fp8_fp4_paged_mqa_logits`` + the decode top-k.
 
@@ -136,13 +167,34 @@ def flashinfer_indexer_decode(
     [B * next_n, k] int32 request-local positions, ``-1`` padded. The launches
     depend only on the shapes, so a captured CUDA graph replays for any
     lengths.
+
+    candidate_blocks: a v4.1 candidate layer's [B * next_n, C] int32
+    request-local block ids (blocks of candidate_block_size keys). The source
+    (candidate_write) fills them with each row's top C blocks, as
+    select_candidate_blocks does; a consumer ranks each row within them, as
+    apply_candidate_mask + the top-k do.
     """
     from flashinfer.dsa_indexer import dsa_indexer_det_topk
 
+    role = (
+        ""
+        if candidate_blocks is None
+        else " (candidate source)"
+        if candidate_write
+        else " (candidate consumer)"
+    )
     logger.info_once(
-        "Using FlashInfer's fused SM120 indexer for decode (top-k %d).",
+        "Using FlashInfer's fused SM120 indexer for decode%s (top-k %d).",
+        role,
         output.shape[1],
     )
+    candidates = {}
+    if candidate_blocks is not None:
+        candidates["candidate_block_size"] = candidate_block_size
+        if candidate_write:
+            candidates["candidate_out"] = candidate_blocks
+        else:
+            candidates["candidate_blocks"] = candidate_blocks
     indices = _contiguous_output(output)
     dsa_indexer_det_topk(
         q,
@@ -156,6 +208,7 @@ def flashinfer_indexer_decode(
         backend="sm120",
         block_table=block_table,
         context_lens=context_lens,
+        **candidates,
     )
     if indices is not output:
         output.copy_(indices)

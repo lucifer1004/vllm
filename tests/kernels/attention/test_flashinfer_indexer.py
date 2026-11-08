@@ -33,7 +33,9 @@ TOPK = 2048
 BLOCK_SIZE = 64
 
 
-def _run(monkeypatch, metadata, q, weights, kv_cache, rows, fused, workspace=None):
+def _run(
+    monkeypatch, metadata, q, weights, kv_cache, rows, fused, workspace=None, **kw
+):
     monkeypatch.setattr(
         indexer_layer,
         "get_forward_context",
@@ -69,6 +71,7 @@ def _run(monkeypatch, metadata, q, weights, kv_cache, rows, fused, workspace=Non
         use_pcp=False,
         pcp_shard_decode_requests=False,
         dense_mha_metadata_layer_name="",
+        **kw,
     )
     return out
 
@@ -284,3 +287,95 @@ def test_decode_graph_replays_with_new_lengths(monkeypatch):
     torch.accelerator.synchronize()
     expected = _run(monkeypatch, fresh, q_rows, weights, kv_cache, rows, True)
     assert torch.equal(out.sort(dim=1).values, expected.sort(dim=1).values)
+
+
+CAND_BLOCKS, CAND_BLOCK_SIZE = 2048, 8
+
+
+def _count_candidate_calls(monkeypatch, write):
+    """Counts the decode calls that hand FlashInfer candidate blocks in the
+    given role, so a silent fallback to DeepGEMM fails the test."""
+    calls = []
+    real = indexer_layer.flashinfer_indexer_decode
+
+    def spy(*args, **kw):
+        if kw.get("candidate_blocks") is not None and kw["candidate_write"] == write:
+            calls.append(1)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(indexer_layer, "flashinfer_indexer_decode", spy)
+    return calls
+
+
+def _candidate_lists(lens, next_n):
+    """What a v4.1 source layer publishes per decode row: its newest block and
+    others, every block when it has at most CAND_BLOCKS, -1 padded."""
+    rows = []
+    for n in lens.tolist():
+        for j in range(next_n):
+            visible = n - next_n + 1 + j
+            nb = (visible + CAND_BLOCK_SIZE - 1) // CAND_BLOCK_SIZE
+            row = torch.full((CAND_BLOCKS,), -1, dtype=torch.int32)
+            if nb <= CAND_BLOCKS:
+                row[:nb] = torch.randperm(nb, dtype=torch.int32)
+            else:
+                row[0] = nb - 1
+                row[1:] = torch.randperm(nb - 1, dtype=torch.int32)[: CAND_BLOCKS - 1]
+            rows.append(row)
+    return torch.stack(rows).cuda()
+
+
+@pytest.mark.parametrize("next_n", [1, 2])
+def test_decode_candidate_consumer_matches_dense(monkeypatch, workspace_init, next_n):
+    """A v4.1 consumer's decode rows rank within their candidate blocks as the
+    DeepGEMM logits, candidate mask and top-k do."""
+    batch = 4
+    kv_cache, block_table, q, weights = _decode_inputs(batch, next_n)
+    lens = torch.tensor([1500, 39000, 2048, 20000], device="cuda", dtype=torch.int32)
+    metadata = _decode_metadata(block_table, lens, next_n)
+    rows = batch * next_n
+    q_rows = q.view(rows, HEADS, 128)
+    cand = _candidate_lists(lens, next_n)
+    kw = dict(candidate_blocks=cand, candidate_block_size=CAND_BLOCK_SIZE)
+    calls = _count_candidate_calls(monkeypatch, write=False)
+    fused = _run(monkeypatch, metadata, q_rows, weights, kv_cache, rows, True, **kw)
+    assert calls == [1]
+    dense = _run(monkeypatch, metadata, q_rows, weights, kv_cache, rows, False, **kw)
+    _assert_same_topk(
+        fused, dense, _decode_scores(kv_cache, block_table, q, weights, next_n)
+    )
+
+
+@pytest.mark.parametrize("next_n", [1, 2])
+def test_decode_candidate_source_matches_dense(monkeypatch, workspace_init, next_n):
+    """A v4.1 source's decode rows publish the blocks select_candidate_blocks
+    picks, beside their own top-k."""
+    batch = 4
+    kv_cache, block_table, q, weights = _decode_inputs(batch, next_n)
+    lens = torch.tensor([1500, 39000, 2048, 20000], device="cuda", dtype=torch.int32)
+    metadata = _decode_metadata(block_table, lens, next_n)
+    rows = batch * next_n
+    q_rows = q.view(rows, HEADS, 128)
+    published = []
+    calls = _count_candidate_calls(monkeypatch, write=True)
+    for fused_path in (True, False):
+        cand = torch.full((rows, CAND_BLOCKS), 7, device="cuda", dtype=torch.int32)
+        out = _run(
+            monkeypatch,
+            metadata,
+            q_rows,
+            weights,
+            kv_cache,
+            rows,
+            fused_path,
+            candidate_blocks=cand,
+            candidate_block_size=CAND_BLOCK_SIZE,
+            candidate_write=True,
+        )
+        published.append((out, cand))
+    assert calls == [1]
+    (fused, fused_blocks), (dense, dense_blocks) = published
+    _assert_same_topk(
+        fused, dense, _decode_scores(kv_cache, block_table, q, weights, next_n)
+    )
+    assert torch.equal(fused_blocks.sort(dim=1).values, dense_blocks.sort(dim=1).values)
