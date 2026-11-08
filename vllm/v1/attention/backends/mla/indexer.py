@@ -10,6 +10,9 @@ import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.attention.dsa.flashinfer_indexer import (
+    flashinfer_indexer_available,
+)
 from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
     FUSED_MQA_TOPK_MAX_KEYS,
     FUSED_MQA_TOPK_MAX_ROWS,
@@ -430,6 +433,16 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     max_local_total_seq_lens: int = 0
 
     pcp_deinterleave_idx: torch.Tensor | None = None
+
+    # Without DCP or PCP, for FlashInfer's segment-form indexer: per request,
+    # its first row relative to token_start (int32 [num_reqs + 1], not clipped
+    # to the query slice) and the context position before that row (int64
+    # [num_reqs]). Row ``r`` of request ``s`` sees the first
+    # ``(req_ctx_start[s] + r - req_query_start[s] + 1) // compress_ratio``
+    # keys of its segment of cu_seq_lens.
+    req_query_start: torch.Tensor | None = None
+    req_ctx_start: torch.Tensor | None = None
+    compress_ratio: int = 1
 
 
 class BuildPrefillChunkMetadataKernel(
@@ -2038,6 +2051,13 @@ def build_prefill_chunk_metadata(
 
     pcp_deinterleave_idx = pcp_plan.deinterleave_idx if pcp_plan is not None else None
 
+    req_query_start = req_ctx_start = None
+    if pcp_plan is None and dcp_world_size == 1 and flashinfer_indexer_available():
+        req_query_start = query_start_loc - qs_start
+        req_ctx_start = (
+            uncompressed_seq_lens[start_idx:end_idx] - query_start_loc.diff()
+        ).to(torch.int64)
+
     token_start = query_start_loc_cpu[start_idx].item()
     if query_slice is not None:
         token_end = token_start + qs_stop
@@ -2062,6 +2082,9 @@ def build_prefill_chunk_metadata(
         local_cu_seq_lens=local_cu_seq_lens,
         local_total_seq_lens=local_total_seq_lens,
         max_local_total_seq_lens=max_local_total_seq_lens,
+        req_query_start=req_query_start,
+        req_ctx_start=req_ctx_start,
+        compress_ratio=compress_ratio,
     )
 
 
