@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FlashInfer's fused SM120 indexer vs the DeepGEMM logits + top-k path,
-through ``sparse_attn_indexer``."""
+through `sparse_attn_indexer`."""
 
 from types import SimpleNamespace
 
@@ -77,7 +77,7 @@ def _run(
 
 
 def _scores(ids, q, k, k_scale, weights):
-    """fp32 scores of the selected keys (row-local ids into ``k``)."""
+    """fp32 scores of the selected keys (row-local ids into `k`)."""
     out = torch.full(ids.shape, -torch.inf, device="cuda")
     for i in range(0, ids.shape[0], 32):
         sel = ids[i : i + 32]
@@ -99,7 +99,7 @@ def _assert_same_topk(fused, dense, scores_fn):
 
 
 @pytest.mark.parametrize("compress_ratio", [1, 4])
-@pytest.mark.parametrize("window", ["all", "query_slice", "row_shard"])
+@pytest.mark.parametrize("window", ["all", "query_slice"])
 def test_prefill_matches_dense(monkeypatch, compress_ratio, window):
     torch.manual_seed(0)
     # Context length and new rows per request; the last is a fresh prompt.
@@ -129,7 +129,6 @@ def test_prefill_matches_dense(monkeypatch, compress_ratio, window):
     k = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
     k_scale = 2.0 ** torch.randint(-3, 3, (keys,), device="cuda").float()
     weights = torch.randn(rows, HEADS, device="cuda") / HEADS
-    sizes = [450, rows - 450] if window == "row_shard" else None
     metadata = DeepseekV32IndexerMetadata(
         seq_lens=torch.tensor(seq_lens, **i32),
         max_seq_len=max(seq_lens),
@@ -139,25 +138,17 @@ def test_prefill_matches_dense(monkeypatch, compress_ratio, window):
         num_prefills=3,
         num_prefill_tokens=rows,
         prefill=DeepseekV32IndexerPrefillMetadata(
-            chunks=[chunk], max_prefill_seq_len=max(seq_lens), row_shard_sizes=sizes
+            chunks=[chunk], max_prefill_seq_len=max(seq_lens)
         ),
     )
-    if sizes is not None:
-        # Rank 1 of two scores rows [450, rows); the exchange needs a TP group.
-        monkeypatch.setattr(indexer_layer, "get_tensor_model_parallel_rank", lambda: 1)
-        monkeypatch.setattr(
-            indexer_layer.PrefillRowShard, "exchange_topk", lambda *a, **kw: None
-        )
     workspace = (k, k_scale.view(torch.uint8).view(keys, 4))
 
     def run(fused):
         out = _run(monkeypatch, metadata, q, weights, k, rows, fused, workspace)
-        return out[chunk.token_start : chunk.token_end][
-            450 - chunk.token_start if sizes else 0 :
-        ]
+        return out[chunk.token_start : chunk.token_end]
 
     fused, dense = run(True), run(False)
-    first = 450 if sizes else chunk.token_start
+    first = chunk.token_start
     # Row r of request s starts at its key segment: absolute key ids.
     seg = torch.tensor([0, *torch.tensor(keys_per_req).cumsum(0).tolist()])
     req = (
