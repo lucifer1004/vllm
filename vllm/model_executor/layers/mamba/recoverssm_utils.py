@@ -24,6 +24,16 @@ def uses_recoverssm(cache_config, num_speculative_tokens: int) -> bool:
     )
 
 
+def uses_gdn_replayssm(cache_config, num_speculative_tokens: int) -> bool:
+    """True when a Qwen GDN layer decodes through ReplaySSM's cached decode.
+
+    ``--use-replayssm`` selects RecoverSSM instead when it runs (with speculative
+    tokens), so the two never share a layer."""
+    return bool(cache_config.use_replayssm) and not uses_recoverssm(
+        cache_config, num_speculative_tokens
+    )
+
+
 def recoverssm_ptr_table(tensors, device) -> torch.Tensor:
     """int64 table of the tensors' data pointers, keeping each uint64 bit pattern.
 

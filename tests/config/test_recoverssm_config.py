@@ -65,7 +65,7 @@ def _config(
             use_kda_recoverssm=False,
             use_gdn_recoverssm=False,
             use_replayssm=use_replayssm,
-            mamba_cache_mode="align",
+            enable_prefix_caching=True,
         ),
         mamba_config=SimpleNamespace(
             enable_stochastic_rounding=False, backend=MambaBackendEnum.TRITON
@@ -141,9 +141,9 @@ def test_runtime_checks_reject(override, value, match):
         _validator()(cfg)
 
 
-def test_pipeline_parallel_without_align_is_accepted():
+def test_pipeline_parallel_without_prefix_caching_is_accepted():
     cfg = _config(TARGET, parallel_config__pipeline_parallel_size=2)
-    cfg.cache_config.mamba_cache_mode = "none"
+    cfg.cache_config.enable_prefix_caching = False
     _validator()(cfg)
     assert cfg.cache_config.use_gdn_recoverssm is True
 
@@ -156,9 +156,11 @@ def test_flag_unset_keeps_the_stock_path():
 
 
 @pytest.mark.parametrize("arch", QWEN_GDN_ARCHS)
-def test_qwen_gdn_replayssm_requires_speculative_decoding(arch):
-    with pytest.raises(ValueError, match="requires speculative decoding"):
-        _validator()(_config(arch, num_spec=0))
+def test_qwen_gdn_replayssm_without_speculation_keeps_gdn_replayssm(arch):
+    # Without draft tokens the flag selects GDN ReplaySSM's cached decode.
+    cfg = _config(arch, num_spec=0)
+    _validator()(cfg)
+    assert cfg.cache_config.use_gdn_recoverssm is False
 
 
 def test_architecture_without_replayssm_support_is_rejected():

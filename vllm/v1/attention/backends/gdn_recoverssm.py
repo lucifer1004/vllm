@@ -235,7 +235,7 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
             record_indices = self._stage_record_indices(
                 m, rows, base["spec_state_indices_tensor"].shape[0]
             )
-            align = self.vllm_config.cache_config.mamba_cache_mode == "align"
+            align = self.vllm_config.cache_config.enable_prefix_caching
             commit = GDNRecoverSSMCommitMetadata(
                 state_indices=base["spec_state_indices_tensor"],
                 query_start_loc=meta.spec_query_start_loc,

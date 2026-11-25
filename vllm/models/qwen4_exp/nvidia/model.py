@@ -16,6 +16,7 @@ from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.recoverssm_utils import uses_gdn_replayssm
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -240,6 +241,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
                 reduce_results=not self.use_hc_sequence_parallel,
+                overlap_ba_proj=True,
             )
         elif layer_type in _QSA_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
@@ -567,8 +569,9 @@ class Qwen4ExpModel(nn.Module):
                         forward_context.is_padding, hidden_states
                     )
                 hidden_states = sp_shard(hidden_states)
-            # Expand only the local token rows when SP is enabled.
-            hidden_states = hidden_states.repeat(1, self.config.hc_count)
+            # Expand only the local token rows when SP is enabled. cat hits a
+            # vectorized copy path; repeat lowers to a slow broadcast copy.
+            hidden_states = torch.cat([hidden_states] * self.config.hc_count, dim=-1)
         else:
             if intermediate_tensors is None:
                 raise ValueError("pipeline stage requires intermediate tensors")
@@ -852,6 +855,9 @@ class Qwen4ExpForCausalLM(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
+            uses_gdn_replayssm(
+                vllm_config.cache_config, vllm_config.num_speculative_tokens
+            ),
         )
 
     @classmethod
@@ -866,6 +872,7 @@ class Qwen4ExpForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
+        cache_config = vllm_config.cache_config
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
@@ -874,6 +881,9 @@ class Qwen4ExpForCausalLM(
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
             num_spec,
+            cache_config.replayssm_buffer_len
+            if uses_gdn_replayssm(cache_config, num_spec)
+            else None,
         )
 
     @classmethod
@@ -1018,7 +1028,7 @@ class Qwen4ExpForConditionalGeneration(
             self.video_pruning_rate = 0.0
             self._tokenizer = None
             self.visual = StageMissingLayer("vision_tower")
-            self._tower_model_names = []
+            self._tower_model_names = ()
         else:
             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
             self._init_video_pruning(multimodal_config)
