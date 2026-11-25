@@ -33,6 +33,14 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
+from vllm.model_executor.kernels.attention.dsa.flashinfer_indexer import (
+    FLASHINFER_INDEXER_MAX_NEXT_N,
+    flashinfer_decode_candidates_supported,
+    flashinfer_indexer_decode,
+    flashinfer_prefill_candidates_supported,
+    flashinfer_indexer_prefill,
+    use_flashinfer_indexer,
+)
 from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
     fused_mqa_topk_chunk,
     fused_mqa_topk_key_scales,
@@ -652,6 +660,34 @@ def sparse_attn_indexer(
         full_context=use_pcp or dcp_world_size == 1,
         candidate_selection=candidate_blocks is not None,
     )
+    flashinfer_indexer = use_flashinfer_indexer(
+        query_shape=q_quant.shape[1:],
+        topk=topk_tokens,
+        fp4_cache=use_fp4_cache,
+        full_context=not use_pcp and dcp_world_size == 1,
+        candidate_selection=candidate_blocks is not None,
+    )
+    # A v4.1 candidate layer's rows: the source publishes its blocks and the
+    # consumers rank within them in FlashInfer's kernels (decode: paged,
+    # prefill: ragged), where the FlashInfer build takes them.
+    flashinfer_candidates = candidate_blocks is not None and use_flashinfer_indexer(
+        query_shape=q_quant.shape[1:],
+        topk=topk_tokens,
+        fp4_cache=use_fp4_cache,
+        full_context=not use_pcp and dcp_world_size == 1,
+        candidate_selection=False,
+    )
+    candidate_shape = dict(
+        num_candidates=0 if candidate_blocks is None else candidate_blocks.shape[1],
+        block_size=candidate_block_size,
+        write=candidate_write,
+    )
+    flashinfer_decode = flashinfer_indexer or (
+        flashinfer_candidates and flashinfer_decode_candidates_supported(**candidate_shape)
+    )
+    flashinfer_prefill = flashinfer_indexer or (
+        flashinfer_candidates and flashinfer_prefill_candidates_supported(**candidate_shape)
+    )
 
     # DeepSelect ranks BF16 decode logits directly; other top-k backends and
     # the DCP merge read an FP32 copy.
@@ -939,6 +975,29 @@ def sparse_attn_indexer(
             if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
+            elif flashinfer_prefill and chunk.req_query_start is not None:
+                # The requests' row ranges within [row_start, row_end).
+                first = row_start - chunk.token_start
+                starts = chunk.req_query_start.clamp(first, first + q_slice.shape[0])
+                assert chunk.req_ctx_start is not None
+                flashinfer_indexer_prefill(
+                    q_slice,
+                    k_quant[: chunk.total_seq_lens],
+                    k_scale[: chunk.total_seq_lens].view(torch.float32).squeeze(-1),
+                    weights[row_start:row_end],
+                    starts - first,
+                    chunk.cu_seq_lens,
+                    chunk.req_ctx_start + (starts[:-1] - chunk.req_query_start[:-1]),
+                    chunk.compress_ratio,
+                    chunk.max_seqlen_k,
+                    topk_indices,
+                    candidate_blocks=None
+                    if candidate_blocks is None
+                    else candidate_blocks[row_start:row_end],
+                    candidate_write=candidate_write,
+                    candidate_block_size=candidate_block_size,
+                )
+                logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
             elif fused_mqa_topk and fused_mqa_topk_chunk(
                 chunk.max_seqlen_k,
                 k_quant.shape[0],
@@ -1148,6 +1207,35 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
+        if (
+            flashinfer_decode
+            and next_n <= FLASHINFER_INDEXER_MAX_NEXT_N
+            and seq_lens.numel() == num_padded_tokens
+            and decode_metadata.global_seq_lens is None
+            # A consumer's candidate block lies within one cache block.
+            and (candidate_blocks is None or candidate_block_size <= kv_cache.shape[1])
+        ):
+            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+            flashinfer_indexer_decode(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                topk_indices,
+                candidate_blocks=(
+                    candidate_blocks[:num_padded_tokens]
+                    if candidate_blocks is not None
+                    else None
+                ),
+                candidate_write=candidate_write,
+                candidate_block_size=candidate_block_size,
+            )
+            if needs_padded_path:
+                _unpack_decode_topk(
+                    topk_indices, topk_indices_buffer, batch_size, decode_lens
+                )
+            return topk_indices_buffer
         if chunk_decode:
             assert decode_metadata.indices is not None
             assert decode_metadata.global_seq_lens is None
@@ -1285,17 +1373,27 @@ def sparse_attn_indexer(
             )
 
         if needs_padded_path:
-            # if padded, we need to unpack
-            # the topk indices removing padded tokens
-            topk_indices = unpack_seq_triton(
-                topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
-                decode_lens,
-            )
-            topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
-                topk_indices
+            _unpack_decode_topk(
+                topk_indices, topk_indices_buffer, batch_size, decode_lens
             )
 
     return topk_indices_buffer
+
+
+def _unpack_decode_topk(
+    topk_indices: torch.Tensor,
+    topk_indices_buffer: torch.Tensor,
+    batch_size: int,
+    decode_lens: torch.Tensor,
+) -> None:
+    """Write the padded decode rows' top-k back without the padding rows."""
+    topk_indices = unpack_seq_triton(
+        topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
+        decode_lens,
+    )
+    topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
+        topk_indices
+    )
 
 
 def sparse_attn_indexer_fake(
