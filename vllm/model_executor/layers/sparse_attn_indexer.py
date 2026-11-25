@@ -35,6 +35,7 @@ from vllm.model_executor.kernels.attention.dsa.flashinfer_indexer import (
     FLASHINFER_INDEXER_MAX_NEXT_N,
     flashinfer_decode_candidates_supported,
     flashinfer_indexer_decode,
+    flashinfer_prefill_candidates_supported,
     flashinfer_indexer_prefill,
     use_flashinfer_indexer,
 )
@@ -618,23 +619,26 @@ def sparse_attn_indexer(
         full_context=not use_pcp and dcp_world_size == 1,
         candidate_selection=candidate_blocks is not None,
     )
-    # A v4.1 candidate layer's decode rows: the source publishes its blocks and
-    # the consumers rank within them in FlashInfer's kernel; prefill rows keep
-    # DeepGEMM.
+    # A v4.1 candidate layer's rows: the source publishes its blocks and the
+    # consumers rank within them in FlashInfer's kernels (decode: paged,
+    # prefill: ragged), where the FlashInfer build takes them.
+    flashinfer_candidates = candidate_blocks is not None and use_flashinfer_indexer(
+        query_shape=q_quant.shape[1:],
+        topk=topk_tokens,
+        fp4_cache=use_fp4_cache,
+        full_context=not use_pcp and dcp_world_size == 1,
+        candidate_selection=False,
+    )
+    candidate_shape = dict(
+        num_candidates=0 if candidate_blocks is None else candidate_blocks.shape[1],
+        block_size=candidate_block_size,
+        write=candidate_write,
+    )
     flashinfer_decode = flashinfer_indexer or (
-        candidate_blocks is not None
-        and use_flashinfer_indexer(
-            query_shape=q_quant.shape[1:],
-            topk=topk_tokens,
-            fp4_cache=use_fp4_cache,
-            full_context=not use_pcp and dcp_world_size == 1,
-            candidate_selection=False,
-        )
-        and flashinfer_decode_candidates_supported(
-            num_candidates=candidate_blocks.shape[1],
-            block_size=candidate_block_size,
-            write=candidate_write,
-        )
+        flashinfer_candidates and flashinfer_decode_candidates_supported(**candidate_shape)
+    )
+    flashinfer_prefill = flashinfer_indexer or (
+        flashinfer_candidates and flashinfer_prefill_candidates_supported(**candidate_shape)
     )
 
     # DeepSelect ranks BF16 decode logits directly; other top-k backends and
@@ -917,7 +921,7 @@ def sparse_attn_indexer(
             if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
-            elif flashinfer_indexer and chunk.req_query_start is not None:
+            elif flashinfer_prefill and chunk.req_query_start is not None:
                 # The requests' row ranges within [row_start, row_end).
                 first = row_start - chunk.token_start
                 starts = chunk.req_query_start.clamp(first, first + q_slice.shape[0])
@@ -933,6 +937,11 @@ def sparse_attn_indexer(
                     chunk.compress_ratio,
                     chunk.max_seqlen_k,
                     topk_indices,
+                    candidate_blocks=None
+                    if candidate_blocks is None
+                    else candidate_blocks[row_start:row_end],
+                    candidate_write=candidate_write,
+                    candidate_block_size=candidate_block_size,
                 )
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
             elif fused_mqa_topk and fused_mqa_topk_chunk(

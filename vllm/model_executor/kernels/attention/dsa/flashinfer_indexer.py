@@ -52,8 +52,9 @@ def use_flashinfer_indexer(
     query_shape: one token's indexer queries, (heads, head_dim);
     fp4_cache: the MXFP4 indexer cache keeps the DeepGEMM path;
     full_context: every rank ranks its rows over the whole context (no DCP or
-    PCP); candidate_selection: a v4.1 two-level selection layer, whose prefill
-    rows keep DeepGEMM (decode: flashinfer_decode_candidates_supported).
+    PCP); candidate_selection: a v4.1 two-level selection layer (see
+    flashinfer_decode_candidates_supported and
+    flashinfer_prefill_candidates_supported).
     Disabled with VLLM_USE_FUSED_MQA_TOPK=0, like the SM100 fused kernel.
     """
     heads, head_dim = tuple(query_shape)
@@ -77,15 +78,7 @@ def _flashinfer_has_candidates() -> bool:
     return "candidate_blocks" in params and "candidate_out" in params
 
 
-def flashinfer_decode_candidates_supported(
-    *, num_candidates: int, block_size: int, write: bool
-) -> bool:
-    """Whether FlashInfer's paged indexer runs a v4.1 candidate layer's decode
-    rows: the source (write) publishes its rows' top blocks with its own
-    top-k, a consumer ranks each row within its blocks. Its prefill rows keep
-    DeepGEMM: under decoder-side SWA replay they are a request's last rows."""
-    if not _flashinfer_has_candidates():
-        return False
+def _candidate_shape_supported(num_candidates: int, block_size: int, write: bool) -> bool:
     if write:
         return block_size in (8, 16) and 0 < num_candidates <= 4096
     return (
@@ -95,8 +88,52 @@ def flashinfer_decode_candidates_supported(
     )
 
 
+def flashinfer_decode_candidates_supported(
+    *, num_candidates: int, block_size: int, write: bool
+) -> bool:
+    """Whether FlashInfer's paged indexer runs a v4.1 candidate layer's decode
+    rows: the source (write) publishes its rows' top blocks with its own
+    top-k, a consumer ranks each row within its blocks."""
+    return _flashinfer_has_candidates() and _candidate_shape_supported(
+        num_candidates, block_size, write
+    )
+
+
+@functools.cache
+def _flashinfer_has_prefill_candidates() -> bool:
+    from flashinfer.experimental.sm120_dsa_indexer import dsa_indexer_det_topk
+
+    params = inspect.signature(dsa_indexer_det_topk).parameters
+    return "candidate_blocks" in params and "candidate_out" in params
+
+
+def flashinfer_prefill_candidates_supported(
+    *, num_candidates: int, block_size: int, write: bool
+) -> bool:
+    """Whether FlashInfer's ragged indexer runs a v4.1 candidate layer's
+    prefill rows, as flashinfer_decode_candidates_supported its decode rows."""
+    return _flashinfer_has_prefill_candidates() and _candidate_shape_supported(
+        num_candidates, block_size, write
+    )
+
+
 def _contiguous_output(out: torch.Tensor) -> torch.Tensor:
     return out if out.is_contiguous() else torch.empty_like(out)
+
+
+def _candidate_role(candidate_blocks: torch.Tensor | None, write: bool) -> str:
+    if candidate_blocks is None:
+        return ""
+    return " (candidate source)" if write else " (candidate consumer)"
+
+
+def _candidate_args(
+    candidate_blocks: torch.Tensor | None, write: bool, block_size: int
+) -> dict:
+    if candidate_blocks is None:
+        return {}
+    key = "candidate_out" if write else "candidate_blocks"
+    return {"candidate_block_size": block_size, key: candidate_blocks}
 
 
 def flashinfer_indexer_prefill(
@@ -110,6 +147,9 @@ def flashinfer_indexer_prefill(
     compress_ratio: int,
     max_seqlen_k: int,
     output: torch.Tensor,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_write: bool = False,
+    candidate_block_size: int = 8,
 ) -> None:
     """Fused replacement of ``fp8_fp4_mqa_logits`` + ``top_k_per_row_prefill``.
 
@@ -121,13 +161,21 @@ def flashinfer_indexer_prefill(
     ``(q_offsets[s] + u + 1) // compress_ratio`` keys. output: [rows, k] int32,
     written like ``top_k_per_row_prefill``: request-local key ids, ``-1``
     padded.
+
+    candidate_blocks: a v4.1 candidate layer's [rows, C] int32 request-local
+    block ids, as in flashinfer_indexer_decode: the source (candidate_write)
+    fills them with each row's top C blocks, as select_candidate_blocks does;
+    a consumer ranks each row within them, as apply_candidate_mask + the
+    top-k do.
     """
     from flashinfer.dsa_indexer import dsa_indexer_det_topk
 
     logger.info_once(
-        "Using FlashInfer's fused SM120 indexer for prefill (top-k %d).",
+        "Using FlashInfer's fused SM120 indexer for prefill%s (top-k %d).",
+        _candidate_role(candidate_blocks, candidate_write),
         output.shape[1],
     )
+    candidates = _candidate_args(candidate_blocks, candidate_write, candidate_block_size)
     indices = _contiguous_output(output)
     dsa_indexer_det_topk(
         q,
@@ -143,6 +191,7 @@ def flashinfer_indexer_prefill(
         return_scores=False,
         backend="sm120",
         k_scale=k_scale,
+        **candidates,
     )
     if indices is not output:
         output.copy_(indices)
@@ -176,25 +225,12 @@ def flashinfer_indexer_decode(
     """
     from flashinfer.dsa_indexer import dsa_indexer_det_topk
 
-    role = (
-        ""
-        if candidate_blocks is None
-        else " (candidate source)"
-        if candidate_write
-        else " (candidate consumer)"
-    )
     logger.info_once(
         "Using FlashInfer's fused SM120 indexer for decode%s (top-k %d).",
-        role,
+        _candidate_role(candidate_blocks, candidate_write),
         output.shape[1],
     )
-    candidates = {}
-    if candidate_blocks is not None:
-        candidates["candidate_block_size"] = candidate_block_size
-        if candidate_write:
-            candidates["candidate_out"] = candidate_blocks
-        else:
-            candidates["candidate_blocks"] = candidate_blocks
+    candidates = _candidate_args(candidate_blocks, candidate_write, candidate_block_size)
     indices = _contiguous_output(output)
     dsa_indexer_det_topk(
         q,
