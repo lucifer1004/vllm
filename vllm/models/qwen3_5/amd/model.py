@@ -68,6 +68,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.mamba.recoverssm_utils import (
+    uses_gdn_replayssm,
+    uses_gdn_replayssm_for,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -654,7 +658,7 @@ class Qwen3_5ForCausalLMBase(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
-            vllm_config.cache_config.use_replayssm,
+            uses_gdn_replayssm_for(vllm_config),
         )
 
     @classmethod
@@ -678,7 +682,9 @@ class Qwen3_5ForCausalLMBase(
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
             num_spec,
-            cache_config.replayssm_buffer_len if cache_config.use_replayssm else None,
+            cache_config.replayssm_buffer_len
+            if uses_gdn_replayssm(cache_config, num_spec)
+            else None,
         )
 
     @classmethod
@@ -863,7 +869,7 @@ class Qwen3_5ForConditionalGeneration(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
-            vllm_config.cache_config.use_replayssm,
+            uses_gdn_replayssm_for(vllm_config),
         )
 
     @classmethod
@@ -887,7 +893,9 @@ class Qwen3_5ForConditionalGeneration(
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
             num_spec,
-            cache_config.replayssm_buffer_len if cache_config.use_replayssm else None,
+            cache_config.replayssm_buffer_len
+            if uses_gdn_replayssm(cache_config, num_spec)
+            else None,
         )
 
     @classmethod
