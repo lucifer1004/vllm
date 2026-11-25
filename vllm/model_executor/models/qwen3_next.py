@@ -44,13 +44,13 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
-from vllm.model_executor.layers.mamba.recoverssm_utils import uses_gdn_replayssm
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.mamba.recoverssm_utils import uses_gdn_replayssm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
@@ -856,7 +856,9 @@ def gdn_mamba_state_dtype_from_config(
         vllm_config.model_config.dtype,
         vllm_config.cache_config.mamba_cache_dtype,
         vllm_config.cache_config.mamba_ssm_cache_dtype,
-        uses_gdn_replayssm(vllm_config.cache_config, vllm_config.num_speculative_tokens),
+        uses_gdn_replayssm(
+            vllm_config.cache_config, vllm_config.num_speculative_tokens
+        ),
     )
 
 

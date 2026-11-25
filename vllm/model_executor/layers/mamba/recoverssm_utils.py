@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-independent RecoverSSM Python helpers: the activation predicate shared by
-layers, models and backends, and argument validation that raises ``ValueError``
+layers, models and backends, and argument validation that raises `ValueError`
 before any raw-pointer kernel launch."""
 
 import torch
@@ -15,8 +15,8 @@ def recoverssm_require(cond: bool, msg: str, component: str = "RecoverSSM") -> N
 def uses_recoverssm(cache_config, num_speculative_tokens: int) -> bool:
     """True when this Qwen GDN / PLE layer runs RecoverSSM for its recurrent states.
 
-    VllmConfig sets ``cache_config.use_gdn_recoverssm`` for the Qwen GDN
-    architectures (Kimi-K3 KDA has its own ``use_kda_recoverssm``). Without
+    VllmConfig sets `cache_config.use_gdn_recoverssm` for the Qwen GDN
+    architectures (Kimi-K3 KDA has its own `use_kda_recoverssm`). Without
     speculative tokens there is nothing to recover, so the stock path runs."""
     return (
         bool(getattr(cache_config, "use_gdn_recoverssm", False))
@@ -27,7 +27,7 @@ def uses_recoverssm(cache_config, num_speculative_tokens: int) -> bool:
 def uses_gdn_replayssm(cache_config, num_speculative_tokens: int) -> bool:
     """True when a Qwen GDN layer decodes through ReplaySSM's cached decode.
 
-    ``--use-replayssm`` selects RecoverSSM instead when it runs (with speculative
+    `--use-replayssm` selects RecoverSSM instead when it runs (with speculative
     tokens), so the two never share a layer."""
     return bool(cache_config.use_replayssm) and not uses_recoverssm(
         cache_config, num_speculative_tokens

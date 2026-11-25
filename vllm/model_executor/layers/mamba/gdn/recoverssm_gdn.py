@@ -15,7 +15,7 @@ sum_t exp(sum_{s>t} g_s) c_t k_t^T and writes the checkpoint once (plus the
 block-boundary state in align mode).
 
 A record only lives from a step's verify to the same step's commit. It is addressed by
-its own row index (``record_indices``), so it can live outside the Mamba page; without
+its own row index (`record_indices`), so it can live outside the Mamba page; without
 record indices it is addressed by the checkpoint's state index."""
 
 from collections.abc import Sequence
@@ -203,7 +203,7 @@ def gdn_recoverssm_verify(
     """Verify a GDN speculative window against its checkpoint without modifying the
     checkpoint. q, k: [1, T, H, K]; v: [1, T, HV, V]; a, b: [T, HV] (or [1, T, HV]);
     checkpoint_state: [blocks, HV, V, K]; replay_cache: [rows, HV, spec_query_len, V +
-    K + 1] fp32, row ``record_indices[i]`` for window i (default: its state index).
+    K + 1] fp32, row `record_indices[i]` for window i (default: its state index).
     Returns out [1, T, HV, V]."""
     _require(
         q.ndim == 4 and q.shape[0] == 1, "q must have shape [1, tokens, heads, dim]"
@@ -609,7 +609,7 @@ class GDNRecoverSSMCommitContext:
         record_indices: torch.Tensor | None = None,
     ) -> None:
         """Fold accepted GDN and convolution inputs into every layer's checkpoint.
-        Window i's replay record is row ``record_indices[i]`` (default: its state
+        Window i's replay record is row `record_indices[i]` (default: its state
         index), as written by the verify."""
         batch = state_indices.shape[0]
         if batch == 0:
@@ -901,8 +901,8 @@ class GDNRecoverSSMGroupedCommit:
         record_indices: torch.Tensor | None = None,
     ) -> None:
         """Fold accepted GDN and convolution inputs into every group's checkpoints.
-        ``state_indices`` and ``block_tables`` hold one tensor per group, in the order
-        of the contexts. ``record_indices`` (one row per window, the same in every
+        `state_indices` and `block_tables` hold one tensor per group, in the order
+        of the contexts. `record_indices` (one row per window, the same in every
         group) addresses out-of-page replay records; without it each group's records
         are in its pages, at its own state indices."""
         _require(

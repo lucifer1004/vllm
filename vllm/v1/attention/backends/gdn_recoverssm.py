@@ -9,8 +9,8 @@ already hold the accepted state), and the metadata carries what the post-samplin
 needs. Mirrors the Kimi-K3 KDA builder's RecoverSSM handling.
 
 The verify writes each window's replay record to the layer's per-request-slot buffer
-(``QwenGatedDeltaNetAttention.recoverssm_replay``) at the request's persistent slot
-(``req_idx``), and the commit reads it from there."""
+(`QwenGatedDeltaNetAttention.recoverssm_replay`) at the request's persistent slot
+(`req_idx`), and the commit reads it from there."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
@@ -115,7 +115,7 @@ def commit_gdn_recoverssm_groups(
     grouped: Any,
 ) -> RecoverSSMPostprocessMetadata | None:
     """Commit the GDN groups of one step with one set of launches
-    (``GDNRecoverSSMGroupedCommit``, built over the groups' contexts in this order).
+    (`GDNRecoverSSMGroupedCommit`, built over the groups' contexts in this order).
     Returns the postprocess metadata once for all groups: the align update writes the
     same per-request values for every group with the same block size."""
     c0 = metas[0].recoverssm_commit
@@ -263,7 +263,7 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
         self, m: CommonAttentionMetadata, rows: torch.Tensor, padded_len: int
     ) -> torch.Tensor:
         """Replay-buffer rows of the spec windows: each request's persistent slot
-        (``req_idx``), so two requests never share a record row. Padding windows (null
+        (`req_idx`), so two requests never share a record row. Padding windows (null
         state, skipped by the kernels) get row 0."""
         cpu = self._record_indices.np
         n = rows.numel()

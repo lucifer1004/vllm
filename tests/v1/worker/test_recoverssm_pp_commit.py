@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """RecoverSSM commit deferred to the PP postprocess on non-last ranks.
 
-A non-last pipeline-parallel rank commits a step ``pp_size`` steps later, after
-the other micro-batch has recorded its own step. ``detach_step`` hands the step
-over with its commit index tensors cloned, and ``commit_step(step=...)`` commits
+A non-last pipeline-parallel rank commits a step `pp_size` steps later, after
+the other micro-batch has recorded its own step. `detach_step` hands the step
+over with its commit index tensors cloned, and `commit_step(step=...)` commits
 that step, skipping rows whose request was freed in between.
 """
 

@@ -476,8 +476,8 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
 def test_teardown_profiling_state_releases_recoverssm_step(monkeypatch):
     """The recorded RecoverSSM step must not outlive the profiling KV cache.
 
-    PIECEWISE capture runs are prepared with ``for_capture=False``, so
-    ``RecoverSSMState`` records their step. Its metadata holds commit contexts
+    PIECEWISE capture runs are prepared with `for_capture=False`, so
+    `RecoverSSMState` records their step. Its metadata holds commit contexts
     that reference the profiling KV cache; keeping it alive past teardown keeps
     that cache allocated and the real KV cache allocation runs out of memory.
     """

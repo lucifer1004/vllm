@@ -8,17 +8,17 @@ sampling, commits the accepted prefix once. The per-model parts (the KDA and GDN
 kernels and their state reconstruction) live with their models; the kernels they share
 are here:
 
-- ``prepare_commit_plan_kernel``: per request, the commit length and the destination
+- `prepare_commit_plan_kernel`: per request, the commit length and the destination
   state blocks (final and, in align mode, the block-boundary block) from the accepted
   counts and the block table;
-- ``compact_conv_state_kernel``: moves the accepted suffix of an extended short-conv
+- `compact_conv_state_kernel`: moves the accepted suffix of an extended short-conv
   window to the front of the destination block (and writes the boundary window in align
   mode).
 
-Both take optional per-group tables (``state_indices_addrs_ptr`` and, for the plan,
-``block_table_addrs_ptr``; ``layer_groups_ptr`` for the per-layer kernel) so that one
+Both take optional per-group tables (`state_indices_addrs_ptr` and, for the plan,
+`block_table_addrs_ptr`; `layer_groups_ptr` for the per-layer kernel) so that one
 launch covers the layers of several KV cache groups, each with its own state indices,
-block table and plan slice (``stride_plan_group`` apart). One group passes ``None``."""
+block table and plan slice (`stride_plan_group` apart). One group passes `None`."""
 
 from vllm.triton_utils import tl, triton
 

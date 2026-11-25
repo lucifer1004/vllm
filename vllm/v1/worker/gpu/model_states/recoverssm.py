@@ -60,7 +60,7 @@ class RecoverSSMState:
         """Hand the recorded step to a deferred commit (non-last PP ranks).
 
         A non-last pipeline-parallel rank commits in the PP postprocess
-        ``pp_size`` steps later, after the other micro-batches have recorded
+        `pp_size` steps later, after the other micro-batches have recorded
         their own steps and rebuilt the persistent metadata buffers. The commit
         index tensors (the replay-record rows among them) are therefore cloned
         here. The replay records themselves live in rows owned by the request
