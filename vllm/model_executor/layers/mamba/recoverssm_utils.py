@@ -29,9 +29,17 @@ def uses_gdn_replayssm(cache_config, num_speculative_tokens: int) -> bool:
 
     `--use-replayssm` selects RecoverSSM instead when it runs (with speculative
     tokens), so the two never share a layer."""
-    return bool(cache_config.use_replayssm) and not uses_recoverssm(
+    return bool(getattr(cache_config, "use_replayssm", False)) and not uses_recoverssm(
         cache_config, num_speculative_tokens
     )
+
+
+def uses_gdn_replayssm_for(vllm_config) -> bool:
+    """`uses_gdn_replayssm` for a model-level state helper, with the draft count
+    taken from `speculative_config` as the state shape helpers take it."""
+    spec = vllm_config.speculative_config
+    num_spec = (spec.num_speculative_tokens or 0) if spec else 0
+    return uses_gdn_replayssm(vllm_config.cache_config, num_spec)
 
 
 def recoverssm_ptr_table(tensors, device) -> torch.Tensor:

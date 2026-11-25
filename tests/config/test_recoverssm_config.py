@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from vllm.config.mamba import MambaBackendEnum
-from vllm.config.vllm import VllmConfig
+from vllm.config.vllm import _QWEN_GDN_RECOVERSSM_ARCHS, VllmConfig
 from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
 from vllm.model_executor.models.interfaces import supports_replayssm
 from vllm.model_executor.models.interns2_mobius import (
@@ -260,10 +260,11 @@ def test_qwen_gdn_models_declare_replayssm_support(cls):
     ],
     ids=lambda c: c.__name__,
 )
-def test_unvalidated_qwen_gdn_subclasses_do_not_inherit_support(cls):
-    """Subclasses outside the RecoverSSM list must keep rejecting --use-replayssm
-    instead of inheriting support from their Qwen3.5 base."""
-    assert not supports_replayssm(cls)
+def test_unvalidated_qwen_gdn_subclasses_do_not_select_recoverssm(cls):
+    """Subclasses outside the RecoverSSM list may inherit GDN ReplaySSM (standard
+    decode) from their Qwen3.5 base, but --use-replayssm with speculative decoding
+    never selects RecoverSSM for them."""
+    assert cls.__name__ not in _QWEN_GDN_RECOVERSSM_ARCHS
 
 
 def _state_config(use_gdn_recoverssm: bool, num_spec: int, tp: int):

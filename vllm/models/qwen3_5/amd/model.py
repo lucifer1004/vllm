@@ -68,7 +68,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.layers.mamba.recoverssm_utils import uses_gdn_replayssm
+from vllm.model_executor.layers.mamba.recoverssm_utils import (
+    uses_gdn_replayssm,
+    uses_gdn_replayssm_for,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -655,9 +658,7 @@ class Qwen3_5ForCausalLMBase(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
-            uses_gdn_replayssm(
-                vllm_config.cache_config, vllm_config.num_speculative_tokens
-            ),
+            uses_gdn_replayssm_for(vllm_config),
         )
 
     @classmethod
@@ -868,9 +869,7 @@ class Qwen3_5ForConditionalGeneration(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
-            uses_gdn_replayssm(
-                vllm_config.cache_config, vllm_config.num_speculative_tokens
-            ),
+            uses_gdn_replayssm_for(vllm_config),
         )
 
     @classmethod
